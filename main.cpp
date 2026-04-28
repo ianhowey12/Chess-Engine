@@ -1,5 +1,6 @@
 #define DEBUG 0
-#define USE_SCORE_BUCKETS 0
+#define PERFORMANCE 0
+#define PRINT_PATHS 0
 #define CHECK_FOR_CHECK 1
 
 #include <stdio.h>
@@ -12,9 +13,6 @@
 #include <atomic>
 
 using namespace std;
-
-
-// Pointer allocation macros
 
 // This free wrapper crashes if a non-null pointer is unallocated, so all unallocated pointers must ALWAYS be null.
 // free(p) frees iff non-null.
@@ -42,16 +40,15 @@ bool showBoardCoordinates = 1;
 bool useCapitalCoordinates = 1;
 bool evaluationPrintChoices = 0;
 bool usePlusesOnEvalNumbers = 1;
+bool printAnalysisResponses = 0;
 // Settings that affect the actual evaluation algorithm.
-double evaluationTimeLimitMin = 1.0; // seconds
-double evaluationTimeLimitMax = 1.0; // seconds
-double evaluationTimeLimitAnalysis = 1.0; // seconds
-int evaluationDepthLimit = 30; // 0 means do not add root's children to queue, etc.
-int defaultSeedReps = 50;
+int evaluationTimeLimitMin = 1000; // ms
+int evaluationTimeLimitMax = 1000; // ms
+int evaluationTimeLimitAnalysis = 1000; // ms
+int evaluationDepthLimit = 20; // Number of tree levels allowed. Nodes may be created at depth [0, evaluationDepthLimit) with the root having depth 0. evaluationDepthLimit must be 1 to create the root.
 
 bool initComplete = 0;
 bool setupComplete = 0;
-
 
 enum drawSettings {
     NO_DRAWS = 0,
@@ -78,21 +75,12 @@ int fileLinePos = 0; // only used for reading and writing files
 char* moveString;
 int moveStringLength = 0;
 
-typedef int eval;
+typedef short eval;
 
 
 // Resizing info.
 double nodeCapMultiplier = 1.5;
 int nodeCapAdder = 10;
-
-double futuresHeapCapMultiplier = 1.5;
-int futuresHeapCapAdder = 10;
-
-int numBuckets = 2000;
-double bucketRange = 0.1;
-double bucketStart = 0.0; // so total range is from score = 0 to score = 200 (extremes have no bounds)
-double bucketCapMultiplier = 1.2;
-int bucketCapAdder = 10;
 
 // Node sizing info.
 #define MISC_SIZE 12
@@ -100,6 +88,27 @@ int bucketCapAdder = 10;
 
 // All information about a position node.
 typedef struct {
+    char moveFrom;
+    char moveTo;
+    short numChildren;
+    int childStartIndex; // position in global array nodes, made an int so resizing does not change this location
+    eval e;
+    short cost; // the minimum cost of any path from this node to a leaf in its subtree
+} node;
+
+
+// The data source for the node tree.
+atomic<int> numNodes;
+atomic<int> nodeCap; // doesn't need to be modified by a random thread during evaluation unless resizing, which will break the multithreading and must be done after pausing all threads
+node* nodes;
+atomic<bool> nodeCapReached;
+
+// The moves from the root which will be sorted by eval.
+node* sortedMoves[LEGAL_MOVES_UPPER_BOUND]; // Length is stored in root as number of children.
+
+// A position, including a board and some miscellaneous data.
+typedef struct {
+    char board[64];
     char wKINGSIDE_CASTLE;
     char wQUEENSIDE_CASTLE;
     char bKINGSIDE_CASTLE;
@@ -112,30 +121,7 @@ typedef struct {
     char SQUARE_TO;
     char PLAYER_TURN;
     char GAME_STATE;
-    
-    int parentIndex;
-    int numChildren;
-    int childStartIndex; // position in global array nodes, made an int so resizing does not change this location
-    int numMoves;
-    int moveStartIndex; // position in global move arrays, made an int so resizing does not change this location
-
-    atomic<eval> e; // eval only changed by the owner thread after computing static eval and at the end by the main thread when updating full tree
-    double score; // computed from parent score, difference from best sibling, etc.
-} N;
-
-
-// The data source for the node tree.
-atomic<int> numNodes;
-atomic<int> nodeCap; // doesn't need to be modified by a random thread during evaluation unless resizing, which will break the multithreading and must be done after pausing all threads
-N* nodes;
-
-// The moves from the root which will be sorted by eval.
-N** sortedMoves; // Length is stored in root as number of children.
-
-atomic<int> globalMoveLength;
-atomic<int> globalMoveCap; // doesn't need to be modified by a random thread during evaluation unless resizing, which will break the multithreading and must be done after pausing all threads
-char* globalMoveFrom;
-char* globalMoveTo;
+} position;
 
 // Move for playing and undoing moves.
 typedef struct {
@@ -147,58 +133,35 @@ typedef struct {
     char enPassantSquare;
 } M;
 
-// Extra data used only by the driver to represent a position in addition to boards.
-typedef struct {
-    char wKINGSIDE_CASTLE;
-    char wQUEENSIDE_CASTLE;
-    char bKINGSIDE_CASTLE;
-    char bQUEENSIDE_CASTLE;
-    char EN_PASSANT_FILE;
-    char FIFTY_MOVE_COUNTER;
-    char wKING_SQUARE;
-    char bKING_SQUARE;
-    char SQUARE_FROM;
-    char SQUARE_TO;
-    char PLAYER_TURN;
-    char GAME_STATE;
-} D;
+// An arbitrary value that should never be checked by the program.
+#define UNDEFINED -1
 
+// Search algorithm data.
 #define MAX_DEPTH 100
+
+int mainPathIndices[MAX_DEPTH];
+int mainPathLength = 0;
 
 // Information only accessed by one thread.
 typedef struct {
 
     thread thr;
-    atomic<bool> run; // Whether the thread should calculate next time it checks this.
-    atomic<bool> running; // Whether the thread is calculating.
-    atomic<bool> live; // Whether the thread should stay alive next time it checks this.
 
-    // Calculating board to play and undo moves on.
-    char cb[64];
+    // Allow this path to be accessed by other threads for backtracking.
+    atomic<bool> hasPath;
+    // The node indices in the path found by this thread.
+    int nodePathIndices[MAX_DEPTH];
+    int nodePathLength;
 
-    // Shared size (number of nodes) for both heap and bucket list.
-    int futuresQueueSize;
+    // Calculating position to play and undo moves on.
+    position pos;
 
-    // Heap of nodes indices that this thread will evaluate next, sorted by their own score values.
-    // Each element is a pointer because the nodes themselves (besides the root) are never being stored, only pointed to.
-    int* futuresHeap;
-    int futuresHeapCap;
-
-    // Buckets of nodes to evaluate next.
-    int** buckets;
-    int* bucketCap;
-    int* bucketLength;
-    int lowestBucketIndex; // the least bucket index containing a value
-
-    // All legal children of a position before setting the examined node's child start.
+    // All legal children of a position found and recorded before setting the examined node's child start.
     char childFroms[LEGAL_MOVES_UPPER_BOUND];
     char childTos[LEGAL_MOVES_UPPER_BOUND];
     eval childEvals[LEGAL_MOVES_UPPER_BOUND];
     eval bestChildEval;
     int childPoolLength;
-
-    // Move sequence for playing and undoing moves.
-    M* moves;
 
     // Temporary pieces and their cumulative values for both players used to evaluate all moves from a position.
     eval whiteValue;
@@ -209,20 +172,20 @@ typedef struct {
     char evalPieces[64]; // There will never be more pieces on the board than board squares, so 64 is enough.
     char evalSquares[64];
 
-#if CHECK_FOR_CHECK
-    char kingSquare;
-#endif
 } T;
 
 T* threads;
 int numThreads;
-atomic<int> numThreadsRunning;
 atomic<int> numThreadsAlive;
+
+// Evaluation control data.
+unsigned long long endTime = 0;
+unsigned long long nodeAddLimit = 0;
+unsigned long long nodeExamineLimit = 0;
 
 
 // Combined stats from all threads.
 atomic<int> calcNumNodesAdded;
-atomic<int> calcNumMovesAdded;
 atomic<int> calcNumNodesExamined;
 // Average number of moves in a position is calculable from the above three stats.
 atomic<int> calcNumStalematesFound;
@@ -230,33 +193,13 @@ atomic<int> calcNumWhiteWinsFound;
 atomic<int> calcNumBlackWinsFound;
 atomic<int> calcNumNormalsFound;
 
-//int* calcNumNodesAddedDepth; // Number of total positions found at each depth.
-//int* calcNumMovesAddedDepth; // Number of positions queued (total found minus checkmates/stalemates) at each depth.
-//int* calcNumNodesExaminedDepth; // Number of positions examined at each depth.
+atomic<int> calcNumNodesAddedDepth[MAX_DEPTH];
+atomic<int> calcNumNodesExaminedDepth[MAX_DEPTH];
 
 
-
-// An arbitrary value that should never be checked by the program.
-#define UNDEFINED -1
-
-/*
-
-
-enum misc {
-    wKINGSIDE_CASTLE = 64,
-    wQUEENSIDE_CASTLE = 65,
-    bKINGSIDE_CASTLE = 66,
-    bQUEENSIDE_CASTLE = 67,
-    EN_PASSANT_FILE = 68,
-    FIFTY_MOVE_COUNTER = 69,
-    wKING_SQUARE = 70,
-    bKING_SQUARE = 71,
-    SQUARE_FROM = 72,
-    SQUARE_TO = 73,
-    PLAYER_TURN = 74,
-    GAME_STATE = 75
-};
-*/
+// Search algorithm data accessed by multiple threads.
+atomic<bool> treeLock;
+atomic<bool> killThreads;
 
 enum gameStates {
     NORMAL = 0,
@@ -265,7 +208,7 @@ enum gameStates {
     DRAW = 3
 };
 
-#define ROOT_SCORE 0.0
+#define ROOT_SCORE 1.0
 #define WHITE_WINS_EVAL 32767 // The eval of a White checkmate position.
 #define BLACK_WINS_EVAL -32768 // The eval of a Black checkmate position.
 #define DRAW_EVAL 0 // The eval of a stalemate position.
@@ -273,6 +216,9 @@ enum gameStates {
 #define BLACK_WINS_EVAL_THRESHOLD -30000 // The maximum eval to be considered a forced mate by Black.
 #define EVAL_FORCED_MATE_INCREMENT 1 // The difference in eval between a checkmate and mate-in-one, etc.
 #define TEMPO_EVAL 25
+
+#define MAX_COST 32767
+
 
 #define NUM_PIECES 12
 enum pieces {
@@ -305,7 +251,7 @@ typedef struct {
 // Basic data used to fill the point tables.
 // King value is high only because king weights need to vary more than other pieces.
 char startingPieceCounts[NUM_PIECES] = { 8, 2, 2, 2, 1, 1, 8, 2, 2, 2, 1, 1 };
-eval piecePointValues[NUM_PIECES] = { 100, 300, 320, 500, 900, 3000, -100, -300, -320, -500, -900, 3000 };
+eval piecePointValues[NUM_PIECES] = { 100, 300, 320, 500, 900, 100, -100, -300, -320, -500, -900, -100 };
 #define TOTAL_MATERIAL 6940 // The sum of White's piece points at the beginning of the game.
 
 // All weight tables that must be stored.
@@ -314,17 +260,23 @@ W bestWeights; // The best table from training and the one always used when not 
 W* trainingWeights; // The tables used only for training.
 
 
-// First row is rank 1, etc.
-char startingBoard[64] = {
-    3, 1, 2, 4, 5, 2, 1, 3,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1,
-    6, 6, 6, 6, 6, 6, 6, 6,
-    9, 7, 8, 10, 11, 8, 7, 9
+position startingPos = {
+    {
+        3, 1, 2, 4, 5, 2, 1, 3,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1,
+        6, 6, 6, 6, 6, 6, 6, 6,
+        9, 7, 8, 10, 11, 8, 7, 9
+    },
+    1, 1, 1, 1, -1, 0, 4, 60, UNDEFINED, UNDEFINED, WHITE, NORMAL
 };
+
+// The root position of an evaluation, used to get to the leaves.
+position rootPosition;
+
 
 // Data for playing against engine.
 char playerRole = BLACK;
@@ -332,12 +284,10 @@ char playerRole = BLACK;
 #define DIFFICULTY_MAX 9
 
 // Analysis position.
-char* analysisBoard;
-D analysisD;
+position analysisPos;
 
 // All previous board states in this game including the current one.
-char** history;
-D* historyD; // Extra data about each position.
+position* history;
 int gameLength = 0; // Number of positions in this game (length of history)
 
 
@@ -362,6 +312,12 @@ int gameLength = 0; // Number of positions in this game (length of history)
 
 #define mv(y) examineMove(t, x, y)
 
+unsigned long long getTime() {
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);
+    unsigned long long t = ((unsigned long long)now.tv_sec % (unsigned long long)1000000000) * (unsigned long long)1000000000 + (unsigned long long)now.tv_nsec;
+    return t;
+}
 
 unsigned long long randPrev = 0x940b19e3fd06b7a5;
 unsigned long long randState = 0x1e964d81c33fa402;
@@ -597,42 +553,16 @@ void drawBoard(char* b, bool playerTurn) {
 
 // Setup the board to the starting game position given all the references of the position data.
 void setupBoard() {
-    for (int i = 0; i < gameLength; i++) {
-        clear(history[i]);
-    }
-
     gameLength = 1;
-
-    history = (char**)realloc(history, sizeof(char*));
-    historyD = (D*)realloc(historyD, sizeof(D));
-
-    history[0] = (char*)calloc(64, 1);
-
-    for (int i = 0; i < 64; i++) {
-        history[0][i] = startingBoard[i];
-    }
-    historyD->wKINGSIDE_CASTLE = 1;
-    historyD->wQUEENSIDE_CASTLE = 1;
-    historyD->bKINGSIDE_CASTLE = 1;
-    historyD->bQUEENSIDE_CASTLE = 1;
-    historyD->EN_PASSANT_FILE = -1;
-    historyD->FIFTY_MOVE_COUNTER = 0;
-    historyD->wKING_SQUARE = 4;
-    historyD->bKING_SQUARE = 60;
-    historyD->SQUARE_FROM = UNDEFINED;
-    historyD->SQUARE_TO = UNDEFINED;
-    historyD->PLAYER_TURN = WHITE;
-    historyD->GAME_STATE = NORMAL;
-
-    // 1, 1, 1, 1, -1, 0, 4, 60, UNDEFINED, UNDEFINED, WHITE, NORMAL
+    history = (position*)realloc(history, sizeof(position));
+    history[0] = startingPos;
 }
 
-// Play a given move on the given board and update all miscs except from, to, and player turn.
-// Return the en passant square or -1.
-char playMoveUpdating(char* b, N* n) {
-    char eps = -1;
-    char from = n->SQUARE_FROM;
-    char to = n->SQUARE_TO;
+// Play a given move on the given position and update all data except from, to, and player turn.
+void playMoveUpdating(position* pos) {
+    char from = pos->SQUARE_FROM;
+    char to = pos->SQUARE_TO;
+    char* b = pos->board;
 
     // Get the type of piece being promoted to or negative if no promotion.
     char promotion = (to - 64) / 8;
@@ -649,16 +579,16 @@ char playMoveUpdating(char* b, N* n) {
     char p = b[from];
     char q = b[to];
 
-    if (n->FIFTY_MOVE_COUNTER < 100) (n->FIFTY_MOVE_COUNTER)++;
+    if (pos->FIFTY_MOVE_COUNTER < 100) (pos->FIFTY_MOVE_COUNTER)++;
 
     // If capturing, reset 50-move counter.
     bool capture = 0;
     if (q != EMPTY) {
-        n->FIFTY_MOVE_COUNTER = 0;
+        pos->FIFTY_MOVE_COUNTER = 0;
         capture = 1;
     }
 
-    n->EN_PASSANT_FILE = -1;
+    pos->EN_PASSANT_FILE = -1;
 
     // Make default move at beginning - it will be overridden by pawn promotions.
     b[to] = p;
@@ -666,35 +596,33 @@ char playMoveUpdating(char* b, N* n) {
 
     switch (p) {
     case wPAWN:
-        n->FIFTY_MOVE_COUNTER = 0; // 50-move rule
+        pos->FIFTY_MOVE_COUNTER = 0; // 50-move rule
         if (rf == 1 && rt == 3) { // en passant availability
-            n->EN_PASSANT_FILE = ct;
+            pos->EN_PASSANT_FILE = ct;
         }
         else if (promotion > -1) { // white promotion
             b[to] = promotion + 1;
         }
         else if (rf == 4 && !capture && cf != ct) { // white en passant
             b[to - 8] = EMPTY;
-            eps = to - 8;
         }
         break;
     case bPAWN:
-        n->FIFTY_MOVE_COUNTER = 0; // 50-move rule
+        pos->FIFTY_MOVE_COUNTER = 0; // 50-move rule
         if (rf == 6 && rt == 4) { // en passant availability
-            n->EN_PASSANT_FILE = ct;
+            pos->EN_PASSANT_FILE = ct;
         }
         else if (promotion > -1) { // black promotion
             b[to] = promotion + 3;
         }
         else if (rf == 3 && !capture && cf != ct) { // black en passant
             b[to + 8] = EMPTY;
-            eps = to + 8;
         }
         break;
     case wKING:
-        n->wKINGSIDE_CASTLE = 0;
-        n->wQUEENSIDE_CASTLE = 0;
-        n->wKING_SQUARE = to;
+        pos->wKINGSIDE_CASTLE = 0;
+        pos->wQUEENSIDE_CASTLE = 0;
+        pos->wKING_SQUARE = to;
         if (from == 4 && to == 6) { // WK
             b[5] = wROOK; b[7] = EMPTY;
         }
@@ -703,9 +631,9 @@ char playMoveUpdating(char* b, N* n) {
         }
         break;
     case bKING:
-        n->bKINGSIDE_CASTLE = 0;
-        n->bQUEENSIDE_CASTLE = 0;
-        n->bKING_SQUARE = to;
+        pos->bKINGSIDE_CASTLE = 0;
+        pos->bQUEENSIDE_CASTLE = 0;
+        pos->bKING_SQUARE = to;
         if (from == 60 && to == 62) { // BK
             b[61] = bROOK; b[63] = EMPTY;
         }
@@ -715,23 +643,21 @@ char playMoveUpdating(char* b, N* n) {
         break;
     case wROOK:
         if (from == 7) {
-            n->wKINGSIDE_CASTLE = 0;
+            pos->wKINGSIDE_CASTLE = 0;
         }
         else if (from == 0) {
-            n->wQUEENSIDE_CASTLE = 0;
+            pos->wQUEENSIDE_CASTLE = 0;
         }
         break;
     case bROOK:
         if (from == 63) {
-            n->bKINGSIDE_CASTLE = 0;
+            pos->bKINGSIDE_CASTLE = 0;
         }
         else if (from == 56) {
-            n->bQUEENSIDE_CASTLE = 0;
+            pos->bQUEENSIDE_CASTLE = 0;
         }
         break;
     }
-
-    return eps;
 }
 
 // Play a given move on the given board without updating miscs.
@@ -788,108 +714,6 @@ char playMove(char* b, M* move) {
     }
 
     return eps;
-}
-
-// SQUARE_FROM, SQUARE_TO, and PLAYER_TURN in the given parameter must be set.
-// Play a given move on the given board and update all OTHER miscs.
-void playMoveDriver(char* b, D* d) {
-    char from = d->SQUARE_FROM;
-    char to = d->SQUARE_TO;
-
-    // Get the type of piece being promoted to or negative if no promotion.
-    char promotion = (to - 64) / 8;
-
-    // Set moveTo to the true destination square.
-    if (to >= 96) {
-        to = to % 8;
-    }
-    else if (to >= 64) {
-        to = 56 + (to % 8);
-    }
-
-    char rf = from / 8, cf = from % 8, rt = to / 8, ct = to % 8;
-    char p = b[from];
-    char q = b[to];
-
-    if (d->FIFTY_MOVE_COUNTER < 100) (d->FIFTY_MOVE_COUNTER)++;
-
-    // If capturing, reset 50-move counter.
-    bool capture = 0;
-    if (q != EMPTY) {
-        d->FIFTY_MOVE_COUNTER = 0;
-        capture = 1;
-    }
-
-    d->EN_PASSANT_FILE = -1;
-
-    // Make default move at beginning - it will be overridden by pawn promotions.
-    b[to] = p;
-    b[from] = EMPTY;
-
-    switch (p) {
-    case wPAWN:
-        d->FIFTY_MOVE_COUNTER = 0; // 50-move rule
-        if (rf == 1 && rt == 3) { // en passant availability
-            d->EN_PASSANT_FILE = ct;
-        }
-        else if (promotion > -1) { // white promotion
-            b[to] = promotion + 1;
-        }
-        else if (rf == 4 && !capture && cf != ct) { // white en passant
-            b[to - 8] = EMPTY;
-        }
-        break;
-    case bPAWN:
-        d->FIFTY_MOVE_COUNTER = 0; // 50-move rule
-        if (rf == 6 && rt == 4) { // en passant availability
-            d->EN_PASSANT_FILE = ct;
-        }
-        else if (promotion > -1) { // black promotion
-            b[to] = promotion + 3;
-        }
-        else if (rf == 3 && !capture && cf != ct) { // black en passant
-            b[to + 8] = EMPTY;
-        }
-        break;
-    case wKING:
-        d->wKINGSIDE_CASTLE = 0;
-        d->wQUEENSIDE_CASTLE = 0;
-        d->wKING_SQUARE = to;
-        if (from == 4 && to == 6) { // WK
-            b[5] = wROOK; b[7] = EMPTY;
-        }
-        else if (from == 4 && to == 2) { // WQ
-            b[3] = wROOK; b[0] = EMPTY;
-        }
-        break;
-    case bKING:
-        d->bKINGSIDE_CASTLE = 0;
-        d->bQUEENSIDE_CASTLE = 0;
-        d->bKING_SQUARE = to;
-        if (from == 60 && to == 62) { // BK
-            b[61] = bROOK; b[63] = EMPTY;
-        }
-        else if (from == 60 && to == 58) { // BQ
-            b[59] = bROOK; b[56] = EMPTY;
-        }
-        break;
-    case wROOK:
-        if (from == 7) {
-            d->wKINGSIDE_CASTLE = 0;
-        }
-        else if (from == 0) {
-            d->wQUEENSIDE_CASTLE = 0;
-        }
-        break;
-    case bROOK:
-        if (from == 63) {
-            d->bKINGSIDE_CASTLE = 0;
-        }
-        else if (from == 56) {
-            d->bQUEENSIDE_CASTLE = 0;
-        }
-        break;
-    }
 }
 
 // Undo a move on this thread's calculating board.
@@ -1067,7 +891,8 @@ bool kingNotInCheck(char* b, char x) {
 // Get the total value of all of White's pieces and the total value of all of Black's pieces.
 // This function is called before finding all moves in a position and evaluating them.
 inline void evalFullBoard(T* t) {
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
     W* w = currentWeights;
     int np = t->numEvalPieces;
 
@@ -1080,18 +905,22 @@ inline void evalFullBoard(T* t) {
         char aPiece = t->evalPieces[i];
         char aSquare = t->evalSquares[i];
 
+        if (aPiece == -1) continue;
+
         // Iterate over all pieces on the board.
         for (int j = 0; j < np; j++) {
 
             char bPiece = t->evalPieces[j];
             char bSquare = t->evalSquares[j];
 
+            eval x = w->weight[bPiece][bSquare][aPiece][aSquare];
+
             // Add the weight of a affecting b.
             if (bPiece >= wPAWN && bPiece <= wKING) {
-                t->whiteValue += w->weight[bPiece][bSquare][aPiece][aSquare];
+                t->whiteValue += x;
             }
             else {
-                t->blackValue += w->weight[bPiece][bSquare][aPiece][aSquare];
+                t->blackValue += x;
             }
         }
     }
@@ -1148,8 +977,8 @@ Next, we calculate t->whiteValueChange and t->blackValueChange from the three li
 Finally, we compute and return what the eval would be after adding those value changes to both players' values.
  */
 inline eval computeEvalMove(T* t, char moveFrom, char trueMoveto, char promotion) {
-
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
     char x = b[moveFrom];
     char y = b[trueMoveto];
 
@@ -1444,7 +1273,11 @@ inline eval computeEvalMove(T* t, char moveFrom, char trueMoveto, char promotion
 
 // Execute an already known to be semilegal move while calculating, adding a new move to the childPool.
 void examineMove(T* t, char moveFrom, char moveTo) {
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
+
+    // Determine the player making the move.
+    char playerTurn = b[moveFrom] >= bPAWN && b[moveFrom] <= bKING ? BLACK : WHITE;
 
     char trueMoveto = moveTo;
     char promotion = -1;
@@ -1468,32 +1301,37 @@ void examineMove(T* t, char moveFrom, char moveTo) {
 
         // Play the move.
         move.enPassantSquare = playMove(b, &move);
-
+        
         // Get the new king square.
-        char kingSquare;
-        if (b[trueMoveto] == wKING || b[trueMoveto] == bKING) {
-            kingSquare = trueMoveto;
-        }
-        else {
-            kingSquare = t->kingSquare;
+        char kingSquare = 0;
+        
+        if (playerTurn == BLACK) {
+            if (b[trueMoveto] == bKING) {
+                kingSquare = trueMoveto;
+            }
+            else {
+                kingSquare = pos->bKING_SQUARE;
+            }
+        }else{
+            if (b[trueMoveto] == wKING) {
+                kingSquare = trueMoveto;
+            }
+            else {
+                kingSquare = pos->wKING_SQUARE;
+            }
         }
 
         // Make sure we have not just moved into check.
-        // If it will be White's turn, check Black's (player moving) king and vice versa.
-        if (!kingNotInCheck(b, kingSquare)) {
-            undoMove(b, &move);
-            return;
-        }
-
-        // Undo the move.
+        bool inCheck = !kingNotInCheck(b, kingSquare);
         undoMove(b, &move);
+        if(inCheck) return;
 
     #endif
     
     eval e = 0;
 
     // If moving to other king, we define this to be a guaranteed checkmate.
-    ifBlack(moveFrom) {
+    if(playerTurn == BLACK) {
         if (b[trueMoveto] == wKING) {
             e = BLACK_WINS_EVAL;
         }
@@ -1526,10 +1364,11 @@ void examineMove(T* t, char moveFrom, char moveTo) {
     (t->childPoolLength)++;
 }
 
-// Make all semilegal moves for a white pawn.
+// Make all legal moves for a white pawn.
 inline void examineWhitePawn(T* t, char x, char epf) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (r == 6) {
         ifEmpty(56 + c) { // promoting move
@@ -1579,10 +1418,11 @@ inline void examineWhitePawn(T* t, char x, char epf) {
     }
 }
 
-// Make all semilegal moves for a black pawn.
+// Make all legal moves for a black pawn.
 inline void examineBlackPawn(T* t, char x, char epf) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
     
     if (r == 1) {
         ifEmpty(0 + c) { // promoting move
@@ -1632,10 +1472,11 @@ inline void examineBlackPawn(T* t, char x, char epf) {
     }
 }
 
-// Make all semilegal moves for a white knight.
+// Make all legal moves for a white knight.
 inline void examineWhiteKnight(T* t, char x) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (r > 0) {
         if (c > 1) {
@@ -1687,10 +1528,11 @@ inline void examineWhiteKnight(T* t, char x) {
     }
 }
 
-// Make all semilegal moves for a black knight.
+// Make all legal moves for a black knight.
 inline void examineBlackKnight(T* t, char x) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (r > 0) {
         if (c > 1) {
@@ -1742,10 +1584,11 @@ inline void examineBlackKnight(T* t, char x) {
     }
 }
 
-// Make all semilegal moves for a white bishop.
+// Make all legal moves for a white bishop.
 inline void examineWhiteBishop(T* t, char x) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     char l = r < c ? r : c;
     l = x - 9 * l;
@@ -1780,10 +1623,11 @@ inline void examineWhiteBishop(T* t, char x) {
     }
 }
 
-// Make all semilegal moves for a black bishop.
+// Make all legal moves for a black bishop.
 inline void examineBlackBishop(T* t, char x) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     char l = r < c ? r : c;
     l = x - 9 * l;
@@ -1818,10 +1662,11 @@ inline void examineBlackBishop(T* t, char x) {
     }
 }
 
-// Make all semilegal moves for a white rook.
+// Make all legal moves for a white rook.
 inline void examineWhiteRook(T* t, char x) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     for (char X = x - 8; X >= 0; X -= 8) {
         ifWhite(X) break;
@@ -1847,10 +1692,11 @@ inline void examineWhiteRook(T* t, char x) {
     }
 }
 
-// Make all semilegal moves for a black rook.
+// Make all legal moves for a black rook.
 inline void examineBlackRook(T* t, char x) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     for (char X = x - 8; X >= 0; X -= 8) {
         ifBlack(X) break;
@@ -1876,22 +1722,23 @@ inline void examineBlackRook(T* t, char x) {
     }
 }
 
-// Make all semilegal moves for a white queen.
+// Make all legal moves for a white queen.
 inline void examineWhiteQueen(T* t, char x) {
     examineWhiteBishop(t, x);
     examineWhiteRook(t, x);
 }
 
-// Make all semilegal moves for a black queen.
+// Make all legal moves for a black queen.
 inline void examineBlackQueen(T* t, char x) {
     examineBlackBishop(t, x);
     examineBlackRook(t, x);
 }
 
-// Make all semilegal moves for a white king.
+// Make all legal moves for a white king.
 inline void examineWhiteKing(T* t, char x) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (r > 0) {
         ifNonWhite(x - 8) {
@@ -1935,8 +1782,10 @@ inline void examineWhiteKing(T* t, char x) {
     }
 }
 
+// Make all legal kingside castle moves for a white king.
 inline void examineWK(T* t, char x) {
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (x == 4 && b[5] == EMPTY && b[6] == EMPTY && b[7] == wROOK) {
         if (kingNotInCheck(b, 4)) {
@@ -1956,8 +1805,10 @@ inline void examineWK(T* t, char x) {
     }
 }
 
+// Make all legal queenside castle moves for a white king.
 inline void examineWQ(T* t, char x) {
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (x == 4 && b[3] == EMPTY && b[2] == EMPTY && b[1] == EMPTY && b[0] == wROOK) {
         if (kingNotInCheck(b, 4)) {
@@ -1977,10 +1828,11 @@ inline void examineWQ(T* t, char x) {
     }
 }
 
-// Make all semilegal moves for a black king.
+// Make all legal moves for a black king.
 inline void examineBlackKing(T* t, char x) {
     char r = x / 8, c = x % 8;
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (r > 0) {
         ifNonBlack(x - 8) {
@@ -2024,8 +1876,10 @@ inline void examineBlackKing(T* t, char x) {
     }
 }
 
+// Make all legal kingside castle moves for a black king.
 inline void examineBK(T* t, char x) {
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (x == 60 && b[61] == EMPTY && b[62] == EMPTY && b[63] == bROOK) {
         if (kingNotInCheck(b, 60)) {
@@ -2045,8 +1899,10 @@ inline void examineBK(T* t, char x) {
     }
 }
 
+// Make all legal queenside castle moves for a black king.
 inline void examineBQ(T* t, char x) {
-    char* b = t->cb;
+    position* pos = &(t->pos);
+    char* b = pos->board;
 
     if (x == 60 && b[59] == EMPTY && b[58] == EMPTY && b[57] == EMPTY && b[56] == bROOK) {
         if (kingNotInCheck(b, 60)) {
@@ -2066,66 +1922,6 @@ inline void examineBQ(T* t, char x) {
     }
 }
 
-// Add the given node index to this thread's queue based on the given score.
-void addFutureQueue(T* t, int q) {
-
-#if USE_SCORE_BUCKETS
-    double s = (nodes + q)->score;
-
-    // Find the bucket to add to.
-    int b;
-    if (s < bucketStart) {
-        b = 0;
-    }
-    else if ((s - bucketStart) / bucketRange >= numBuckets) {
-        b = numBuckets - 1;
-    }
-    else {
-        b = (int)((s - bucketStart) / bucketRange);
-    }
-
-    // Resize that bucket if necessary.
-    if ((t->bucketLength)[b] >= (t->bucketCap)[b]) {
-        (t->bucketCap)[b] = (int)((double)((t->bucketCap)[b]) * bucketCapMultiplier + (double)bucketCapAdder);
-        (t->buckets)[b] = (int*)realloc((t->buckets)[b], (t->bucketCap)[b] * 4);
-    }
-
-    // Add to the end of that bucket.
-    (t->buckets)[b][(t->bucketLength)[b]] = q;
-
-    if (b < t->lowestBucketIndex) t->lowestBucketIndex = b;
-
-    (t->bucketLength[b])++;
-    (t->futuresQueueSize)++;
-#else
-    (t->futuresQueueSize)++;
-    int l = t->futuresQueueSize;
-    if (l >= t->futuresHeapCap) { // one greater due to heap offset
-        t->futuresHeapCap = (int)((double)(t->futuresHeapCap) * futuresHeapCapMultiplier + (double)futuresHeapCapAdder);
-        t->futuresHeap = (int*)realloc(t->futuresHeap, t->futuresHeapCap * 4);
-    }
-
-    int* h = t->futuresHeap;
-    h[l] = q; // one greater due to heap offset
-
-    // Reheap.
-    int i = l; // one greater due to heap offset
-    while (i > 1) {
-        int p = i / 2;
-        if ((nodes + h[i])->score < (nodes + h[p])->score) {
-            int temp = h[i];
-            h[i] = h[p];
-            h[p] = temp;
-        }
-        else {
-            break;
-        }
-        i = p;
-    }
-
-#endif
-}
-
 // If e is the eval of a checkmate, return the eval of a mate in one, etc.
 inline eval evalForcedMateDelay(eval e) {
     if (e >= WHITE_WINS_EVAL_THRESHOLD) {
@@ -2137,67 +1933,11 @@ inline eval evalForcedMateDelay(eval e) {
     return e;
 }
 
-// Backtrack up the tree, keeping the eval of every node in the tree perfectly up-to-date.
-inline void evalBacktrack(N* n) {
-    eval oldEval;
-    N* first = n;
-
-    // Update the parents' evals to keep the eval of every node in the tree perfectly up-to-date.
-    while(1) {
-
-        char turn = n->PLAYER_TURN;
-        if (turn == BLACK) {
-
-            oldEval = (n->e).load();
-
-            // Set the parent's eval to be the best (minimum considering it's Black's turn) of the child evals.
-            int nc = n->numChildren;
-            N* c = nodes + n->childStartIndex;
-            eval e = evalForcedMateDelay((c->e).load());
-            for (int i = 1; i < nc; i++) {
-                c++;
-                eval childEval = evalForcedMateDelay((c->e).load());
-                if (childEval < e) e = childEval;
-            }
-
-            // If the parent's eval did not change, there is no reason to keep going.
-            if (oldEval == e) {
-                break;
-            }
-
-            (n->e).store(e);
-        }
-        else {
-
-            oldEval = (n->e).load();
-
-            // Set the parent's eval to be the best (maximum considering it's White's turn) of the child evals.
-            int nc = n->numChildren;
-            N* c = nodes + n->childStartIndex;
-            eval e = evalForcedMateDelay((c->e).load());
-            for (int i = 1; i < nc; i++) {
-                c++;
-                eval childEval = evalForcedMateDelay((c->e).load());
-                if (childEval > e) e = childEval;
-            }
-
-            // If the parent's eval did not change, there is no reason to keep going.
-            if (oldEval == e) {
-                break;
-            }
-
-            (n->e).store(e);
-        }
-
-        if (n == nodes) break;
-        n = nodes + n->parentIndex;
-    }
-}
-
 // Make all legal moves for all pieces that can move.
-inline void examinePieces(T* t, N* n) {
-    char* b = t->cb;
-    char playerTurn = n->PLAYER_TURN;
+inline void examinePieces(T* t) {
+    position* pos = &(t->pos);
+    char* b = pos->board;
+    char playerTurn = pos->PLAYER_TURN;
 
     // Clear the childPool so we can find all children.
     t->childPoolLength = 0;
@@ -2216,33 +1956,29 @@ inline void examinePieces(T* t, N* n) {
     // Calculate the full board t->whiteValue and t->blackValue.
     evalFullBoard(t);
 
-#if CHECK_FOR_CHECK
-    if (playerTurn == WHITE) {
-        t->kingSquare = n->wKING_SQUARE;
-    }
-    else {
-        t->kingSquare = n->bKING_SQUARE;
-    }
-#endif
-
     if (playerTurn == WHITE) {
         for (char x = 0; x < 64; x++) {
             char y = b[x];
             if (y != EMPTY) {
                 if (y == wPAWN) {
-                    examineWhitePawn(t, x, n->EN_PASSANT_FILE); continue;
-                } else if (y == wKNIGHT) {
+                    examineWhitePawn(t, x, pos->EN_PASSANT_FILE); continue;
+                }
+                else if (y == wKNIGHT) {
                     examineWhiteKnight(t, x); continue;
-                } else if (y == wBISHOP) {
+                }
+                else if (y == wBISHOP) {
                     examineWhiteBishop(t, x); continue;
-                } else if (y == wROOK) {
+                }
+                else if (y == wROOK) {
                     examineWhiteRook(t, x); continue;
-                } else if (y == wQUEEN){
+                }
+                else if (y == wQUEEN) {
                     examineWhiteQueen(t, x); continue;
-                } else if (y == wKING) {
+                }
+                else if (y == wKING) {
                     examineWhiteKing(t, x);
-                    if (n->wKINGSIDE_CASTLE) examineWK(t, x);
-                    if (n->wQUEENSIDE_CASTLE) examineWQ(t, x);
+                    if (pos->wKINGSIDE_CASTLE) examineWK(t, x);
+                    if (pos->wQUEENSIDE_CASTLE) examineWQ(t, x);
                     continue;
                 }
             }
@@ -2253,19 +1989,24 @@ inline void examinePieces(T* t, N* n) {
             char y = b[x];
             if (y != EMPTY) {
                 if (y == bPAWN) {
-                    examineBlackPawn(t, x, n->EN_PASSANT_FILE); continue;
-                } else if (y == bKNIGHT) {
+                    examineBlackPawn(t, x, pos->EN_PASSANT_FILE); continue;
+                }
+                else if (y == bKNIGHT) {
                     examineBlackKnight(t, x); continue;
-                } else if (y == bBISHOP) {
+                }
+                else if (y == bBISHOP) {
                     examineBlackBishop(t, x); continue;
-                } else if (y == bROOK) {
+                }
+                else if (y == bROOK) {
                     examineBlackRook(t, x); continue;
-                } else if (y == bQUEEN) {
+                }
+                else if (y == bQUEEN) {
                     examineBlackQueen(t, x); continue;
-                } else if (y == bKING) {
+                }
+                else if (y == bKING) {
                     examineBlackKing(t, x);
-                    if (n->bKINGSIDE_CASTLE) examineBK(t, x);
-                    if (n->bQUEENSIDE_CASTLE) examineBQ(t, x); 
+                    if (pos->bKINGSIDE_CASTLE) examineBK(t, x);
+                    if (pos->bQUEENSIDE_CASTLE) examineBQ(t, x);
                     continue;
                 }
             }
@@ -2273,410 +2014,550 @@ inline void examinePieces(T* t, N* n) {
     }
 }
 
-// Called after creating a node from a move.
-// Find, execute, and evaluate, and store (using global move parallel array indices) all moves from the given board and node.
-// Queue the given node.
-// Called both to expand tree and find all legal moves in an arbitrary position.
-// Return whether there are no more global moves available.
-// This function is also called when finding all legal moves to determine the legal moves outside of a position evaluation and to determine if stalemate happens.
-inline bool examineAllSemilegalMoves(T* t, int nodeIndex, int depth) {
-    N* n = nodes + nodeIndex;
-    char playerTurn = n->PLAYER_TURN;
-    char* b = t->cb;
+// Called after reaching a leaf node.
+// Find, evaluate, and store all moves from the given position and node.
+inline void examineAllSemilegalMoves(T* t, node* n, int depth) {
+    position* pos = &(t->pos);
+    char* b = pos->board;
+    char playerTurn = pos->PLAYER_TURN;
 
     W* w = currentWeights;
 
-    examinePieces(t, n);
+    examinePieces(t);
 
     char* froms = t->childFroms;
     char* tos = t->childTos;
     eval* evals = t->childEvals;
     eval bestEval = t->bestChildEval;
 
-    #if CHECK_FOR_CHECK
-        // If checking for check, the child moves are legal moves, not semilegal moves.
-        // If there are no legal moves, mark this node as checkmate or stalemate.
-        if (t->childPoolLength == 0) {
-            char kingSquare = playerTurn == BLACK ? n->bKING_SQUARE : n->wKING_SQUARE;
+    // If there are no legal moves, mark this node as checkmate or stalemate.
+    if (t->childPoolLength == 0) {
+        char kingSquare = playerTurn == BLACK ? pos->bKING_SQUARE : pos->wKING_SQUARE;
 
-            if (kingNotInCheck(b, kingSquare)) {
-                n->GAME_STATE = DRAW;
-                n->e.store(DRAW_EVAL);
-                calcNumStalematesFound.fetch_add(1);
-            }
-            else if (playerTurn == BLACK) {
-                n->GAME_STATE = WHITE_WIN;
-                n->e.store(WHITE_WINS_EVAL);
-                calcNumWhiteWinsFound.fetch_add(1);
-            }
-            else {
-                n->GAME_STATE = BLACK_WIN;
-                n->e.store(BLACK_WINS_EVAL);
-                calcNumBlackWinsFound.fetch_add(1);
-            }
-
-            return 0;
+        if (kingNotInCheck(b, kingSquare)) {
+            n->e = DRAW_EVAL;
+            calcNumStalematesFound.fetch_add(1);
         }
-    #endif
+        else if (playerTurn == BLACK) {
+            n->e = WHITE_WINS_EVAL;
+            calcNumWhiteWinsFound.fetch_add(1);
+        }
+        else {
+            n->e = BLACK_WINS_EVAL;
+            calcNumBlackWinsFound.fetch_add(1);
+        }
+
+        return;
+    }
 
     // Handle checkmates by capturing the king that were just found by calling this node a checkmate.
     if (bestEval >= WHITE_WINS_EVAL_THRESHOLD) {
-        n->GAME_STATE = WHITE_WIN;
-        n->e.store(WHITE_WINS_EVAL);
+        n->e = WHITE_WINS_EVAL;
         calcNumWhiteWinsFound.fetch_add(1);
-        return 0;
     }
     else if (bestEval <= BLACK_WINS_EVAL_THRESHOLD) {
-        n->GAME_STATE = BLACK_WIN;
-        n->e.store(BLACK_WINS_EVAL);
+        n->e = BLACK_WINS_EVAL;
         calcNumBlackWinsFound.fetch_add(1);
-        return 0;
     }
     else {
-        n->e.store(bestEval);
+        n->e = bestEval;
+        calcNumNormalsFound.fetch_add(1);
     }
-
-    calcNumNormalsFound.fetch_add(1);
-    
-    int newNC = t->childPoolLength;
-
-    // Decide which moves to keep.
-    if (depth >= 4) {
-        // Keep the best 2 moves.
-        int bestMoveIndices[2] = { 0 };
-
-
-
-        //newNC = 2;
-    }
-
-    // Create the moves to keep.
-    int nl = globalMoveLength.fetch_add(newNC);
-    if (nl + newNC > globalMoveCap.load()) {
-        globalMoveLength.fetch_add(-newNC);
-        return 1;
-    }
-    calcNumMovesAdded.fetch_add(newNC);
-
-    // Store the new moves in the new node.
-    n->numMoves = newNC;
-    n->moveStartIndex = nl;
-    for (int i = 0; i < newNC; i++) {
-        globalMoveFrom[nl + i] = froms[i];
-        globalMoveTo[nl + i] = tos[i];
-    }
-
-    // If max depth is reached, do not examine.
-    // (Maybe make another list or priority queue to stash these nodes to be able to evaluate them when increasing max depth in the middle of the evaluation.)
-    if (depth < evaluationDepthLimit) {
-        if (n->parentIndex >= 0) {
-            //n->score = (nodes + n->parentIndex)->score + 4.0;
-            eval parentEval = (nodes + n->parentIndex)->e;
-
-            // Difference from parent's score is eval loss from parent (after setting eval to be the best of opponent's moves (child moves)).
-            if (playerTurn == BLACK) {
-                // If parent is White, losing eval is bad and increases the score.
-                n->score += (double)parentEval - n->e;
-            }else{
-                // If parent is Black, gaining eval is bad and increases the score.
-                n->score += (double)n->e - parentEval;
-            }
-
-
-
-                n->score = depth * 4.0;
-        } else {
-            n->score = ROOT_SCORE;
-        }
-        addFutureQueue(t, nodeIndex);
-    }
-
-    return 0;
 }
 
-// Pop and return the global index of the first (lowest score) queued node from this thread's queue.
-// Assume the queue is not empty.
-int getFirstFuture(T* t) {
-    calcNumNodesExamined.fetch_add(1);
+// Get the square for a square index in human-readable format.
+char* squareToString(char x) {
 
-    #if USE_SCORE_BUCKETS
-
-        // Remove the last element in the bucket with the lowest index containing an element.
-        int* bl = t->bucketLength;
-        for (int i = t->lowestBucketIndex;; i++) {
-            if (bl[i] > 0) {
-                bl[i]--;
-                (t->futuresQueueSize)--;
-                int o = (t->buckets)[i][bl[i]];
-                t->lowestBucketIndex = i;
-                return o;
-            }
-        }
-
-    #else
-
-        // Remove the minimum element at index 1 due to heap offset.
-        int* h = t->futuresHeap;
-        int o = h[1];
-        int s = t->futuresQueueSize; // one greater due to heap offset
-        (t->futuresQueueSize)--;
-        h[1] = h[s];
-        
-        // Reheap the heap.
-        int i = 1;
-        while (1) {
-            
-            int l = i * 2, r = l + 1;
-            double si = (nodes + h[i])->score;
-            if (h[i] >= numNodes.load()) {
-                printf("NODE OUT OF BOUNDS: %i %i\n", h[i], numNodes.load());
-            }
-
-            if (l >= s) {
-                break;
-            }
-            if (r >= s) {
-                if (si > (nodes + h[l])->score) {
-                    int temp = h[i];
-                    h[i] = h[l];
-                    h[l] = temp;
-                }
-                break;
-            }
-            if ((si
-    > (nodes + h[l])->score)
-                    || si
-    > (nodes + h[r])->score) {
-                // Find the minimum score of left and right children and swap with that one.
-                if ((nodes + h[l])->score < (nodes + h[r])->score) {
-                    int temp = h[i];
-                    h[i] = h[l];
-                    h[l] = temp;
-                    i = l;
-                }
-                else {
-                    int temp = h[i];
-                    h[i] = h[r];
-                    h[r] = temp;
-                    i = r;
-                }
-            } else {
-                break;
-            }
-        }
-
+    if (x < 0) {
+        char* o = (char*)calloc(3, 1);
+        o[0] = '?';
+        o[1] = '?';
+        o[2] = '\0';
         return o;
-
-    #endif
-}
-
-// Examine the highest-priority node.
-// Create a new node for each move.
-// Update the original node's eval based on their evals.
-// Return whether there is no space for more nodes (we can't keep going).
-bool examineNextPosition(T* t) {
-    bool o = 0;
-    char* b = t->cb;
-    int index = getFirstFuture(t);
-    N* n = nodes + index;
-    char playerTurn = n->PLAYER_TURN;
-    
-    #if DEBUG
-        char debugBoard[64];
-        for (int i = 0; i < 64; i++) {
-            debugBoard[i] = b[i];
-        }
-    #endif
-
-    N* p = n;
-    M* move;
-    int d = 0;
-
-    // Traverse back to the root node, collecting the moves.
-    if (n != nodes) { // This check is needed to avoid making the undefined root move (if n is root).
-
-        while (p != nodes) {
-            move = t->moves + d;
-            d++;
-
-            move->f = p->SQUARE_FROM;
-            char to = p->SQUARE_TO;
-            move->tt = to < 64 ? to : to < 96 ? 56 + (to % 8) : to % 8;
-            move->promotion = to < 64 ? -1 : to < 96 ? (to / 8) - 7 : (to / 8) - 5;
-
-            if (p->parentIndex == 0) break;
-            p = nodes + p->parentIndex;
-        }
-
-        // Play those moves in reverse order on the thread's calculating board.
-        for (int i = d - 1; i >= 0; i--) {
-            move = t->moves + i;
-
-            // Find the other characteristics of the moves so we can undo.
-            move->mover = b[move->f];
-            move->captured = b[move->tt];
-            move->enPassantSquare = playMove(b, move);
-        }
     }
 
-    // Make the possible moves into nodes.
-    int nc = n->numMoves;
-    int l = numNodes.fetch_add(nc);
-    if (l + nc > nodeCap.load()) {
-        // TODO: Decide if this is still causing a bug.
-        //printf("NODE EXCEED %i %i %i\n", nc, l + nc, nodeCap.load());
-        numNodes.fetch_add(-nc);
-        return 1;
-    }
-    calcNumNodesAdded.fetch_add(nc);
-
-    n->numChildren = nc;
-    n->childStartIndex = l;
-
-    int legal = 0;
-
-    for (int i = 0; i < nc; i++, l++) {
-        N* newN = nodes + l;
-        
-        // Set some info about the node based on the found move used to create it.
-        int moveIndex = n->moveStartIndex + i;
-        newN->parentIndex = index;
-        newN->SQUARE_FROM = globalMoveFrom[moveIndex];
-        newN->SQUARE_TO = globalMoveTo[moveIndex];
-
-        char playerTurn = 1 - n->PLAYER_TURN;
-        
-        // Set the rest of the info based on the parent node.
-        newN->wKINGSIDE_CASTLE = n->wKINGSIDE_CASTLE;
-        newN->wQUEENSIDE_CASTLE = n->wQUEENSIDE_CASTLE;
-        newN->bKINGSIDE_CASTLE = n->bKINGSIDE_CASTLE;
-        newN->bQUEENSIDE_CASTLE = n->bQUEENSIDE_CASTLE;
-        newN->EN_PASSANT_FILE = -1;
-        newN->FIFTY_MOVE_COUNTER = n->FIFTY_MOVE_COUNTER + 1;
-        newN->wKING_SQUARE = n->wKING_SQUARE;
-        newN->bKING_SQUARE = n->bKING_SQUARE;
-        newN->GAME_STATE = NORMAL;
-        newN->PLAYER_TURN = playerTurn;
-
-        // Set defaults that may be accessed before being set depending on future modifications to this program.
-        newN->numChildren = 0;
-        newN->numMoves = 0;
-        newN->childStartIndex = UNDEFINED;
-        newN->moveStartIndex = 0;
-        newN->e = 0.0;
-        newN->score = 0.0;
-
-        // Play this move, updating newN.
-        M lastMove;
-        lastMove.f = newN->SQUARE_FROM;
-        char to = newN->SQUARE_TO;
-        lastMove.tt = to < 64 ? to : to < 96 ? 56 + (to % 8) : to % 8;
-        lastMove.promotion = to < 64 ? -1 : to < 96 ? (to / 8) - 7 : (to / 8) - 5;
-        lastMove.mover = b[lastMove.f];
-        lastMove.captured = b[lastMove.tt];
-        lastMove.enPassantSquare = playMoveUpdating(b, newN);
-
-        /*
-        
-        
-        // Make sure we have not just moved into check.
-        bool flag = 1;
-        #if CHECK_FOR_CHECK
-            // If it will be White's turn, check Black's (player moving) king and vice versa.
-            char kingSquare = playerTurn == BLACK ? newN->wKING_SQUARE : newN->bKING_SQUARE;
-            if (kingNotInCheck(b, kingSquare)) {
-                legal++;
-            }
-            else {
-                flag = 0;
-            }
-        #endif
-
-        // Examine all moves from this node.
-        if (legal > 0) {
-            if (examineAllSemilegalMoves(t, l, d + 1)) o = 1;
+    if (x >= 64) {
+        char* o = (char*)calloc(4, 1);
+        o[0] = 'a' + (x % 8);
+        o[1] = x >= 96 ? '1' : '8';
+        char promotionRow = (x % 32) / 8;
+        switch (promotionRow) {
+        case 0:
+            o[2] = 'N'; break;
+        case 1:
+            o[2] = 'B'; break;
+        case 2:
+            o[2] = 'R'; break;
+        case 3:
+            o[2] = 'Q'; break;
         }
-        */
-        if (examineAllSemilegalMoves(t, l, d + 1)) o = 1;
-
-        // Undo this move.
-        undoMove(b, &lastMove);
+        o[3] = '\0';
+        return o;
     }
 
-    // Undo the moves going to the root on the thread's calculating board.
-    for (int i = 0; i < d; i++) {
-        undoMove(b, t->moves + i);
-    }
-
-    #if DEBUG
-        // Check if position is now start.
-        for (int i = 0; i < 64; i++) {
-            if (b[i] != debugBoard[i]) {
-                printf("DEBUG: Node %i: B[%i] is %i and old B[%i] is %i.\n", index, i, b[i], i, debugBoard[i]);
-                for (int j = d - 1; j >= 0; j--) {
-                    printf("DEBUG: - Node %i, depth %i: %i -> %i, %i captured %i, eps %i\n", index, d - 1 - j,
-                        ((t->moves) + j)->f, ((t->moves) + j)->tt, ((t->moves) + j)->mover, ((t->moves) + j)->captured, ((t->moves) + j)->enPassantSquare
-                    );
-                }
-            }
-        }
-    #endif
-
-    evalBacktrack(n);
-
+    char* o = (char*)calloc(3, 1);
+    o[0] = 'a' + (x % 8);
+    o[1] = '1' + (x / 8);
+    o[2] = '\0';
     return o;
 }
 
-// Reset the futures queue to the initial empty state from any length and capacity.
-void clearQueueHeavy() {
-    for (int i = 0; i < numThreads; i++) {
-        T* t = threads + i;
+// Get a string for a root move in human-readable format.
+char* moveToString(int i, position* pos) {
+    node* n = sortedMoves[i];
+    char* b = pos->board;
+    char f = n->moveFrom;
+    char t = n->moveTo;
+    char p = b[f];
 
-        #if USE_SCORE_BUCKETS
+    char* o;
 
-            t->futuresQueueSize = 0;
-            int* bc = t->bucketCap;
-            int* bl = t->bucketLength;
-            int** b = t->buckets;
+    if (p == wKING && f == 4 && t == 6 || p == bKING && f == 60 && t == 62) {
+        o = (char*)calloc(4, 1);
+        o[0] = '0';
+        o[1] = '-';
+        o[2] = '0';
+        o[3] = '\0';
+        return o;
+    }
+    if (p == wKING && f == 4 && t == 2 || p == bKING && f == 60 && t == 58) {
+        o = (char*)calloc(6, 1);
+        o[0] = '0';
+        o[1] = '-';
+        o[2] = '0';
+        o[3] = '-';
+        o[4] = '0';
+        o[5] = '\0';
+        return o;
+    }
 
-            // Empty every bucket.
-            for (int i = 0; i < numBuckets; i++) {
-                bc[i] = 0;
-                bl[i] = 0;
-                clear(b[i]);
-            }
-        #else
+    int l = 5, s = 0;
+    if (p != wPAWN && p != bPAWN) {
+        l++;
+        s++;
+    }
 
-            // Make the heap have no nodes (length 1).
-            t->futuresQueueSize = 0;
-            t->futuresHeapCap = 1;
-            t->futuresHeap = (int*)realloc(t->futuresHeap, 4);
-        #endif
+    if (t >= 64) {
+        // If the move is a promotion, add the promotion piece letter at the end.
+        l++;
+        o = (char*)calloc(l, 1);
+
+        switch ((t % 32) / 8) {
+        case 0:
+            o[l - 2] = 'N'; break;
+        case 1:
+            o[l - 2] = 'B'; break;
+        case 2:
+            o[l - 2] = 'R'; break;
+        case 3:
+            o[l - 2] = 'Q'; break;
+        }
+
+        // Set the destination to the true destination of the promotion.
+        if (t >= 96) {
+            t %= 8;
+        }
+        else {
+            t = 56 + (t % 8);
+        }
+    }
+    else {
+        o = (char*)calloc(l, 1);
+    }
+
+    // Indicate the moving piece if it is not a pawn.
+    switch (p) {
+    case EMPTY:
+        o[0] = '?'; break;
+    case wKNIGHT:
+    case bKNIGHT:
+        o[0] = 'N'; break;
+    case wBISHOP:
+    case bBISHOP:
+        o[0] = 'B'; break;
+    case wROOK:
+    case bROOK:
+        o[0] = 'R'; break;
+    case wQUEEN:
+    case bQUEEN:
+        o[0] = 'Q'; break;
+    case wKING:
+    case bKING:
+        o[0] = 'K'; break;
+    }
+
+    // Indicate the square we are moving from.
+    if (f < 0 || f >= 64) {
+        o[s] = '?';
+        o[s + 1] = '?';
+    }
+    else {
+        o[s] = 'a' + (f % 8);
+        o[s + 1] = '1' + (f / 8);
+    }
+
+    // Indicate the square we are moving to.
+    if (t < 0 || t >= 64) {
+        o[s + 2] = '?';
+        o[s + 3] = '?';
+    }
+    else {
+        o[s + 2] = 'a' + (t % 8);
+        o[s + 3] = '1' + (t / 8);
+    }
+
+    o[l - 1] = '\0';
+    return o;
+}
+
+void printEval(eval e) {
+    int x = (int)e;
+
+    if (x >= WHITE_WINS_EVAL_THRESHOLD) {
+        printf("+M%i", WHITE_WINS_EVAL - x);
+    }
+    else if (x <= BLACK_WINS_EVAL_THRESHOLD) {
+        printf("-M%i", x - BLACK_WINS_EVAL);
+    }
+    else if (x > 0) {
+        if (usePlusesOnEvalNumbers) {
+            printf("+");
+        }
+        printf("%i", x / 100);
+        printf(".%i%i", (x / 10) % 10, x % 10);
+    }
+    else {
+        printf("-");
+        printf("%i", -x / 100);
+        printf(".%i%i", (-x / 10) % 10, -x % 10);
     }
 }
 
-// Reset the futures queue to the initial empty state from any length and capacity, without freeing any memory.
-void clearQueueLight() {
-    for (int i = 0; i < numThreads; i++) {
-        T* t = threads + i;
+void printTreeHelper(node* n, char turn, int depth, int depthLimit, int maxMoves) {
+    if (depth > depthLimit) return;
 
-        #if USE_SCORE_BUCKETS
+    for (int i = 0; i < depth; i++) {
+        printf("\t");
+    }
+    int nc = n->numChildren;
+    
+    printf(squareToString(n->moveFrom));
+    printf(squareToString(n->moveTo));
+    printf(": ");
+    printEval(n->e);
+    printf(" / %i [%i]\n", n->cost, nc);
 
-            t->futuresQueueSize = 0;
+    node* children[LEGAL_MOVES_UPPER_BOUND];
+    for (int i = 0; i < nc; i++) {
+        children[i] = nodes + n->childStartIndex + i;
+    }
 
-            // Empty every bucket.
-            for (int i = 0; i < numBuckets; i++) {
-                (t->bucketLength)[i] = 0;
+    // Sort the moves by eval.
+    for (int i = 0; i < nc; i++) {
+        for (int j = i + 1; j < nc; j++) {
+            int d = (int)children[i]->e - (int)children[j]->e;
+            if ((turn == BLACK && d > 0) || (turn == WHITE && d < 0)) {
+                node* temp = children[i];
+                children[i] = children[j];
+                children[j] = temp;
             }
-        #else
-            // Make the heap have no nodes (length 1).
-            t->futuresQueueSize = 0; // good because allocated
+        }
+    }
 
-        #endif
+    if (nc > maxMoves) nc = maxMoves;
+    for (int i = 0; i < nc; i++) {
+        printTreeHelper(children[i], 1 - turn, depth + 1, depthLimit, maxMoves);
     }
 }
 
-// Reset the calc statistics for this thread.
+void printTree(node* n, int depthLimit, int maxMoves) {
+    printTreeHelper(n, rootPosition.PLAYER_TURN, 0, depthLimit, maxMoves);
+}
+
+// Update node costs of a path.
+inline void updateCosts(int* nodePath, int start) {
+    char rootTurn = rootPosition.PLAYER_TURN;
+
+    for (int i = start; i >= 0; i--) {
+        int index = nodePath[i];
+        node* curr = nodes + index;
+        char turn = (rootTurn + i) % 2;
+        int turnMultiplier = turn == BLACK ? -1 : 1;
+
+        // Set this node's cost to the maximum of child cost plus eval loss plus a depth loss.
+        int nc = curr->numChildren;
+
+        int minCost = MAX_COST; // Cost will be maximum if there are no moves, preventing this node from being examined again.
+        for (int j = 0; j < nc; j++) {
+            node* c = nodes + curr->childStartIndex + j;
+            // If it is White's turn, add how much the eval decreases from curr to c.
+            // If it is Black's turn, add how much the eval increases from curr to c.
+            int cost = (int)c->cost + ((int)curr->e - (int)c->e) * turnMultiplier;
+            if (cost < minCost) {
+                minCost = cost;
+            }
+        }
+
+        int depthCost = 2048 >> i;
+        minCost += depthCost;
+
+        curr->cost = minCost >= MAX_COST ? MAX_COST : minCost;
+    }
+}
+
+// Backtrack up the tree, keeping the eval of every node in the tree perfectly up-to-date.
+// Also update node costs.
+inline void evalBacktrack(int* nodePath, int nodePathLength) {
+    char rootTurn = rootPosition.PLAYER_TURN;
+
+    // Update evals of the changing nodes in nodePath.
+    for (int i = nodePathLength - 2; i >= 0; i--) {
+        int index = nodePath[i];
+        node* curr = nodes + index;
+        eval oldEval = curr->e;
+
+        char turn = (rootTurn + i) % 2;
+        if (turn == BLACK) {
+
+            // Set the parent's eval to be the best (minimum considering it's Black's turn) of the child evals.
+            int nc = curr->numChildren;
+            node* c = nodes + curr->childStartIndex;
+            eval e = evalForcedMateDelay(c->e);
+            for (int j = 1; j < nc; j++) {
+                c++;
+                eval childEval = evalForcedMateDelay(c->e);
+                if (childEval < e) e = childEval;
+            }
+
+            // If the parent's eval did not change, there is no reason to keep going with eval or score changes.
+            if (oldEval == e) {
+                break;
+            }
+
+            curr->e = e;
+        }
+        else {
+
+            // Set the parent's eval to be the best (maximum considering it's White's turn) of the child evals.
+            int nc = curr->numChildren;
+            node* c = nodes + curr->childStartIndex;
+            eval e = evalForcedMateDelay(c->e);
+            for (int j = 1; j < nc; j++) {
+                c++;
+                eval childEval = evalForcedMateDelay(c->e);
+                if (childEval > e) e = childEval;
+            }
+
+            // If the parent's eval did not change, there is no reason to keep going.
+            if (oldEval == e) {
+                break;
+            }
+
+            curr->e = e;
+        }
+    }
+
+    // Update costs of all nodes in the path.
+    updateCosts(nodePath, nodePathLength - 1);
+}
+
+// Examine the given leaf node with the given thread.
+// Create a new child node for each move.
+// Update evals and other data.
+void examineLeaf(T* t) {
+    calcNumNodesExamined.fetch_add(1);
+    int* path = t->nodePathIndices;
+
+    // Get the root position in t's pos field.
+    position* pos = &(t->pos);
+    *pos = rootPosition;
+
+    // Make the moves in the path to get to the position at the end of the path.
+    int pathLength = t->nodePathLength;
+    for (int i = 1; i < pathLength; i++) {
+        node* x = nodes + path[i];
+        pos->SQUARE_FROM = x->moveFrom;
+        pos->SQUARE_TO = x->moveTo;
+        playMoveUpdating(pos);
+    }
+
+    pos->PLAYER_TURN = (rootPosition.PLAYER_TURN + pathLength + 1) % 2;
+
+    node* leaf = nodes + path[pathLength - 1];
+    examineAllSemilegalMoves(t, leaf, pathLength);
+
+    // If this leaf is at the maximum depth allowed, return without creating child nodes.
+    if (pathLength >= evaluationDepthLimit) return;
+
+    // Increment the number of nodes.
+    int nc = t->childPoolLength;
+    int start = numNodes.fetch_add(nc);
+    if (start + nc > nodeCap.load()) {
+        numNodes.fetch_add(-nc);
+        nodeCapReached.store(1);
+        return;
+    }
+    calcNumNodesAdded.fetch_add(nc);
+
+    // Create the child nodes.
+    leaf->numChildren = nc;
+    leaf->childStartIndex = start;
+
+    for (int i = 0; i < nc; i++) {
+        node* newN = nodes + start + i;
+
+        // Set the new node data.
+        newN->moveFrom = t->childFroms[i];
+        newN->moveTo = t->childTos[i];
+        newN->numChildren = 0;
+        newN->childStartIndex = UNDEFINED;
+        newN->e = t->childEvals[i];
+        newN->cost = 0;
+    }
+}
+
+// Find the best leaf to examine and record its path in the main path or a thread's path.
+void findBestLeaf(int* pathIndices, int* pathLength, int index) {
+    char rootTurn = rootPosition.PLAYER_TURN;
+    char turn = (rootTurn + *pathLength) % 2;
+    int turnMultiplier = turn == BLACK ? -1 : 1;
+
+    pathIndices[(*pathLength)++] = index;
+    node* curr = nodes + index;
+
+    int nc = curr->numChildren;
+    if (nc == 0) {
+        return;
+    }
+
+    // Expand upon the current path by finding the minimum cost among children.
+    int minCost = MAX_COST, minCostIndex = 0;
+    for (int i = 0; i < nc; i++) {
+        node* c = nodes + curr->childStartIndex + i;
+        
+        // If it is White's turn, add how much the eval decreases from curr to c.
+        // If it is Black's turn, add how much the eval increases from curr to c.
+        int cost = (int)c->cost + ((int)curr->e - (int)c->e) * turnMultiplier;
+        if (cost < minCost) {
+            minCost = cost;
+            minCostIndex = i;
+        }
+    }
+
+    findBestLeaf(pathIndices, pathLength, curr->childStartIndex + minCostIndex);
+}
+
+// Copy and sort the choices of moves from the root node. Root must be created (nodes != 0) before calling this.
+void getSortedChoices() {
+    int numChoices = nodes->numChildren;
+
+    int c = nodes->childStartIndex; // should be 1
+    for (int i = 0; i < numChoices; i++) {
+        sortedMoves[i] = nodes + c + i;
+    }
+
+    bool playerTurn = rootPosition.PLAYER_TURN;
+
+    // Sort the choices using insertion sort.
+    for (int i = 1; i < numChoices; i++) {
+
+        node* n = sortedMoves[i];
+        eval e = n->e;
+        int j = i - 1;
+
+        eval je = sortedMoves[j]->e;
+        while (((playerTurn) && je > e || (!playerTurn) && je < e)) {
+            sortedMoves[j + 1] = sortedMoves[j];
+            j--;
+            if (j < 0) break;
+            je = sortedMoves[j]->e;
+        }
+
+        sortedMoves[j + 1] = n;
+    }
+}
+
+// The search cycle for any thread, including the main thread.
+void searchCycle(T* t) {
+
+    unsigned long long s1 = getTime();
+
+    // Claim the tree.
+    bool locked = 1;
+    while (locked) {
+        if (killThreads.load()) {
+            numThreadsAlive.fetch_add(-1);
+            return;
+        }
+
+        locked = treeLock.exchange(1);
+    }
+#if PERFORMANCE
+    unsigned long long t1 = getTime() - s1;
+    printf("TIMER 1: %lli\n", t1);
+    unsigned long long s2 = getTime();
+    printf("NODES: %i %i\n", calcNumNodesAdded.load());
+#endif
+
+    // Find all paths waiting to be backtracked.
+    for (int i = 0; i < numThreads; i++) {
+        T* ti = threads + i;
+        if (ti->hasPath.load()) {
+
+            // Backtrack this path non-atomically since paths are not accessed by their threads unless that thread owns the lock.
+            // This also sets this path leaf's true cost to enable it to be examined again.
+            evalBacktrack(ti->nodePathIndices, ti->nodePathLength);
+
+            ti->hasPath.store(0);
+        }
+    }
+
+    // If there are no leaves available to be claimed (minimum cost is MAX_COST), unclaim the tree.
+    // Then go to the next iteration.
+    // We just backtracked every node, but more backtrackable nodes might come.
+    // If the tree is complete, all threads will just do this.
+    if (nodes->cost == MAX_COST) {
+        treeLock.store(0);
+        return;
+    }
+
+    // Find the new best leaf.
+    // If the best leaf has MAX_COST cost, then all nodes have MAX_COST cost and we would stop before doing this.
+    t->nodePathLength = 0;
+    findBestLeaf(t->nodePathIndices, &(t->nodePathLength), 0);
+
+#if PRINT_PATHS
+    printf("(%i) Root cost %i, Path length %i: ", calcNumNodesExamined.load(), nodes->cost, t->nodePathLength);
+    for (int i = 1; i < t->nodePathLength; i++) {
+        node* pathNode = nodes + t->nodePathIndices[i];
+        printf(squareToString(pathNode->moveFrom));
+        printf(squareToString(pathNode->moveTo));
+        printf(" ");
+    }
+    printf("\n");
+#endif
+
+    // Set its cost to maximum and update costs.
+    (nodes + t->nodePathIndices[t->nodePathLength - 1])->cost = MAX_COST;
+    updateCosts(t->nodePathIndices, t->nodePathLength - 2);
+
+    // Unclaim the tree.
+    treeLock.store(0);
+
+    // Examine the leaf.
+    examineLeaf(t);
+
+    // Tell other threads to backtrack this leaf.
+    t->hasPath.store(1);
+#if PERFORMANCE
+    unsigned long long t2 = getTime() - s2;
+    printf("TIMER 2: %lli\n", t2);
+    unsigned long long total = t1 + t2;
+    printf("TIMER ALL: %lli\n", total);
+#endif
+}
+
+// Reset the statistics for this thread.
 void resetCalcStats() {
 
     calcNumWhiteWinsFound.store(0);
@@ -2685,54 +2566,14 @@ void resetCalcStats() {
     calcNumNormalsFound.store(0);
 
     calcNumNodesAdded.store(0);
-    calcNumMovesAdded.store(0);
     calcNumNodesExamined.store(0);
-    /*
+    
     int size = evaluationDepthLimit * 4;
 
-    calcNumNodesAddedDepth = (int*)realloc(calcNumNodesAddedDepth, size); // TODO: Decide whether to do these depth-specific stats (may help debugging and training)
-    calcNumMovesAddedDepth = (int*)realloc(calcNumMovesAddedDepth, size);
-    calcNumNodesExaminedDepth = (int*)realloc(calcNumNodesExaminedDepth, size);
-
     for (int i = 0; i < evaluationDepthLimit; i++) {
-        calcNumNodesAddedDepth[i] = 0;
-        calcNumMovesAddedDepth[i] = 0;
-        calcNumNodesExaminedDepth[i] = 0;
+        calcNumNodesAddedDepth[i].store(0);
+        calcNumNodesExaminedDepth[i].store(0);
     }
-    */
-}
-
-// Empty the tree and queue of nodes.
-// This should not need to be called since we don't need to free junk nodes; we can reuse them.
-void clearDataHeavy() {
-
-    // Clear the tree.
-    clear(nodes);
-    nodeCap.store(0);
-    numNodes.store(0);
-
-    // Clear the global moves.
-    clear(globalMoveFrom);
-    clear(globalMoveTo);
-    globalMoveCap.store(0);
-    globalMoveLength.store(0);
-
-    // Clear the node queue.
-    clearQueueHeavy();
-}
-
-// Reset the tree and queue of nodes without actually freeing any memory.
-void clearDataLight() {
-
-    // Clear the tree and global moves.
-    numNodes.store(0);
-    globalMoveLength.store(0);
-
-    // Clear the node queue.
-    clearQueueLight();
-
-    // Reset the calc statistics.
-    resetCalcStats();
 }
 
 // Return true if a white pawn move follows all white pawn rules.
@@ -3017,8 +2858,8 @@ bool isValidBKMove(char* b, char f, char t) {
 // Return true if a black queenside castle follows all castle rules.
 bool isValidBQMove(char* b, char f, char t) {
     if (f == 60 && t == 58 && b[59] == EMPTY && b[58] == EMPTY) {
-
         // No need to check king and rook positions since moving them turns off castling ability.
+
         if (kingNotInCheck(b, 60)) {
             b[60] = -1;
             b[59] = 11;
@@ -3051,15 +2892,16 @@ bool isValidKingMove(char f, char t) {
 
 
 // Return true if a move follows the piece moving rules.
-bool isSemilegalMove(char* b, D* d, char moveFrom, char moveTo) {
+bool isSemilegalMove(position* pos, char moveFrom, char moveTo) {
+    char* b = pos->board;
     char p = b[moveFrom];
     char q = b[moveTo];
 
     switch (p) {
     case 0:
-        return isValidWhitePawnMove(b, moveFrom, moveTo, d->EN_PASSANT_FILE);
+        return isValidWhitePawnMove(b, moveFrom, moveTo, pos->EN_PASSANT_FILE);
     case 6:
-        return isValidBlackPawnMove(b, moveFrom, moveTo, d->EN_PASSANT_FILE);
+        return isValidBlackPawnMove(b, moveFrom, moveTo, pos->EN_PASSANT_FILE);
     case 1:
     case 7:
         return isValidKnightMove(moveFrom, moveTo);
@@ -3073,20 +2915,20 @@ bool isSemilegalMove(char* b, D* d, char moveFrom, char moveTo) {
     case 10:
         return isValidQueenMove(b, moveFrom, moveTo);
     case 5:
-        return isValidKingMove(moveFrom, moveTo) || (d->wKINGSIDE_CASTLE && isValidWKMove(b, moveFrom, moveTo)) || (d->wQUEENSIDE_CASTLE && isValidWQMove(b, moveFrom, moveTo));
+        return isValidKingMove(moveFrom, moveTo) || (pos->wKINGSIDE_CASTLE && isValidWKMove(b, moveFrom, moveTo)) || (pos->wQUEENSIDE_CASTLE && isValidWQMove(b, moveFrom, moveTo));
     case 11:
-        return isValidKingMove(moveFrom, moveTo) || (d->bKINGSIDE_CASTLE && isValidBKMove(b, moveFrom, moveTo)) || (d->bQUEENSIDE_CASTLE && isValidBQMove(b, moveFrom, moveTo));
+        return isValidKingMove(moveFrom, moveTo) || (pos->bKINGSIDE_CASTLE && isValidBKMove(b, moveFrom, moveTo)) || (pos->bQUEENSIDE_CASTLE && isValidBQMove(b, moveFrom, moveTo));
     }
 
     // If moved piece is not a piece, return 0;
     return 0;
 }
 
-// Check if the given move on the given board follows the piece moving rules and does not move into check.
-// Return 1 and record the move in d if legal or 0 if illegal.
-bool isLegalMove(char* b, D* d, char moveFrom, char moveTo) {
-
-    char playerTurn = d->PLAYER_TURN;
+// Check if the given move follows the piece moving rules and does not move into check.
+// Record the move. Return whether it is legal.
+bool isLegalMove(position* pos, char moveFrom, char moveTo) {
+    char* b = pos->board;
+    char playerTurn = pos->PLAYER_TURN;
     if (moveFrom < 0 || moveFrom >= 64) {
         return 0;
     }
@@ -3125,57 +2967,43 @@ bool isLegalMove(char* b, D* d, char moveFrom, char moveTo) {
     }
 
     // Check the piece moving rules.
-    if (!isSemilegalMove(b, d, moveFrom, moveTo)) {
+    if (!isSemilegalMove(pos, moveFrom, moveTo)) {
         return 0;
     }
 
-    // Simulate moving any pieces involved in this move by creating a new position which will be freed.
-    char* B = (char*)calloc(64, 1);
-    for (int i = 0; i < 64; i++) {
-        B[i] = b[i];
-    }
+    // Simulate moving any pieces involved in this move.
+    position copy = *pos;
 
-    d->SQUARE_FROM = moveFrom;
-    d->SQUARE_TO = moveTo;
+    pos->SQUARE_FROM = moveFrom;
+    pos->SQUARE_TO = moveTo;
 
-    // Create a new data variable so we don't change the old one when making the move to check legality.
-    D d0 = *d;
-
-    playMoveDriver(B, &d0);
+    playMoveUpdating(&copy);
     
-    char kingSquare = playerTurn == BLACK ? d0.bKING_SQUARE : d0.wKING_SQUARE;
-    bool notInCheck = kingNotInCheck(B, kingSquare);
-    clear(B);
+    char kingSquare = playerTurn == BLACK ? copy.bKING_SQUARE : copy.wKING_SQUARE;
+    bool notInCheck = kingNotInCheck(copy.board, kingSquare);
     return notInCheck;
 }
 
 // Return true if the given state has occurred at least twice previously in the game history.
 bool checkThreefoldRepetition() {
-
-    char count = 0;
+    bool count = 0;
+    position* pos = history + gameLength - 1;
 
     // Check every second game state (all previous states with same player's turn as now) for equality.
     for (int i = gameLength - 3; i >= 0; i -= 2) {
 
         // Check all board squares for equality.
-        bool equal = 1;
-        for (int j = 0; j < 64; j++) {
-            if (history[gameLength - 1][j] != history[i][j]) {
-                equal = 0; break;
-            }
-        }
-        if (equal) {
+        if (history[gameLength - 1].board == history[i].board) {
             // Check only castling and en passant states.
-            D* di = historyD + i;
-            D* dl = historyD + gameLength - 1;
-            if (dl->wKINGSIDE_CASTLE != di->wKINGSIDE_CASTLE) continue;
-            if (dl->wQUEENSIDE_CASTLE != di->wQUEENSIDE_CASTLE) continue;
-            if (dl->bKINGSIDE_CASTLE != di->bKINGSIDE_CASTLE) continue;
-            if (dl->bQUEENSIDE_CASTLE != di->bQUEENSIDE_CASTLE) continue;
-            if (dl->EN_PASSANT_FILE != di->EN_PASSANT_FILE) continue;
+            position* pi = history + i;
+            if (pi->wKINGSIDE_CASTLE != pos->wKINGSIDE_CASTLE) continue;
+            if (pi->wQUEENSIDE_CASTLE != pos->wQUEENSIDE_CASTLE) continue;
+            if (pi->bKINGSIDE_CASTLE != pos->bKINGSIDE_CASTLE) continue;
+            if (pi->bQUEENSIDE_CASTLE != pos->bQUEENSIDE_CASTLE) continue;
+            if (pi->EN_PASSANT_FILE != pos->EN_PASSANT_FILE) continue;
 
-            count++;
-            if (count >= 2) return 1;
+            if (count) return 1;
+            count = 1;
         }
     }
     return 0;
@@ -3253,6 +3081,7 @@ void readWeights(W* w, const char* path) {
 // Read the data from savedData or choose weights and fill bestWeights.
 void setupWeights(bool useSavedData) {
     W* w = &bestWeights;
+    currentWeights = &bestWeights;
 
     if (useSavedData) {
         // Read from savedData.
@@ -3260,56 +3089,52 @@ void setupWeights(bool useSavedData) {
     }
     else {
         // Fill bestWeights with default values.
-        int p = 0;
-        long long t = 0;
         for (int i = 0; i < NUM_PIECES; i++) {
             for (int j = 0; j < 64; j++) {
                 int r = j / 8, c = j % 8;
                 for (int k = 0; k < NUM_PIECES; k++) {
                     for (int l = 0; l < 64; l++) {
-                        eval* weight = &(w->weight[i][j][k][l]);
+                        int weight = 0;
+
                         if (i == k && j == l) {
                             // Make each piece's self-weight the piece's point value.
                             eval startingWeight = piecePointValues[i];
-                            *weight = startingWeight;
+                            weight = startingWeight;
 
                             // Change each piece's self-weight by a value depending on the piece type and location.
                             if (i == wPAWN) {
-                                *weight += 24 * (r - 2);
+                                weight += 24 * (r - 2);
                                 int x = r > 3 ? 7 - r : r;
-                                *weight += 24 * (x - 1);
+                                weight += 24 * (x - 1);
                             }
                             else if (i == bPAWN) {
-                                *weight -= 24 * (5 - r);
+                                weight -= 24 * (5 - r);
                                 int x = r > 3 ? 7 - r : r;
-                                *weight -= 24 * (x - 1);
+                                weight -= 24 * (x - 1);
                             }
                             else {
                                 if (i >= wPAWN && i <= wKING) {
                                     int x = r > 3 ? 7 - r : r;
                                     int y = c > 3 ? 7 - c : c;
-                                    *weight += (double)startingWeight * 0.06 * (double)(x + y - 3);
+                                    weight += 10.0 * (double)(x + y - 3);
                                 }
                                 else {
                                     int x = r > 3 ? 7 - r : r;
                                     int y = c > 3 ? 7 - c : c;
-                                    *weight += (double)startingWeight * 0.06 * (double)(x + y - 3);
+                                    weight += 10.0 * (double)(x + y - 3);
                                 }
                             }
                         } else {
-                            *weight = 0;
+                            weight = 0;
                         }
-                        t += *weight;
+
+                        if (weight > WHITE_WINS_EVAL) weight = WHITE_WINS_EVAL;
+                        if (weight < BLACK_WINS_EVAL) weight = BLACK_WINS_EVAL;
+                        w->weight[i][j][k][l] = weight;
                     }
                 }
             }
         }
-    }
-}
-
-void setupAnalysisBoard() {
-    if (analysisBoard == NULL) {
-        analysisBoard = (char*)calloc(64, 1);
     }
 }
 
@@ -3324,374 +3149,6 @@ void randomizeWeights(W* w, eval minWeight, eval maxWeight) {
             }
         }
     }
-}
-
-// Evaluate a position for time seconds given the global evaluation settings.
-// Return whether the evaluation was complete (rather than exceeding the time limit).
-bool evaluatePositionTimed(T* t, double time) {
-
-    struct timespec start;
-    timespec_get(&start, TIME_UTC);
-    long long s = start.tv_sec;
-    long long ns = start.tv_nsec;
-
-    for (int i = 0;; i++) {
-
-        // Checking if the thread has been asked to stop.
-        if (!(t->run.load())) {
-            return 0;
-        }
-
-        // Checking if there are no more futures to evaluate.
-        if (t->futuresQueueSize == 0) return 1;
-
-        // Checking if exceeding the time limit for this evaluation period.
-        struct timespec now;
-        timespec_get(&now, TIME_UTC);
-
-        long long diff = ((long long)now.tv_sec - s) * 1000000000ll + ((long long)now.tv_nsec - ns);
-        if ((double)diff >= time * 1000000000.0) {
-            return 0;
-        }
-
-        if (examineNextPosition(t)) return 1;
-    }
-
-    return 0;
-}
-
-// Evaluate a position by examining at most reps positions.
-// Return whether the evaluation was complete (rather than exceeding the position limit).
-bool evaluatePositionReps(T* t, int reps) {
-
-    for (int i = 0;; i++) {
-
-        // Checking if the thread has been stopped.
-        if (!(t->run.load())) {
-            return 0;
-        }
-
-        // Checking if there are no more futures to evaluate.
-        if (t->futuresQueueSize == 0) return 1;
-
-        // Checking if exceeding the position limit for this evaluation period.
-        if (i >= reps) {
-            return 0;
-        }
-
-        if(examineNextPosition(t)) return 1;
-    }
-
-    return 0;
-}
-
-// Evaluate a position until the given thread is stopped.
-// Return whether the evaluation was complete (rather than being stopped).
-bool evaluatePositionInfinite(T* t) {
-
-    for (int i = 0;; i++) {
-
-        // Checking if the thread has been stopped.
-        if (!(t->run.load())) {
-            return 0;
-        }
-
-        // Checking if there are no more futures to evaluate.
-        if (t->futuresQueueSize == 0) {
-            return 1;
-        }
-
-        if (examineNextPosition(t)) return 1;
-    }
-
-    return 0;
-}
-
-// Prepare to evaluate a position, making a deep copy of the given position.
-bool setupEvaluation(char* b, D* d, W* w, int numSeedReps, bool multithread) {
-
-    if (numSeedReps < 0 || numSeedReps > 2000000000) return 0;
-    if (!initComplete) return 0;
-
-    currentWeights = w;
-
-    clearDataLight();
-
-    // Clear all the threads.
-    for (int i = 0; i < numThreads; i++) {
-        T* t = threads + i;
-
-        // Construct the board on all threads.
-        for (int j = 0; j < 64; j++) {
-            (t->cb)[j] = b[j];
-        }
-    }
-
-    // Construct the root node (nodes[0]) from the given data.
-    calcNumNodesAdded.fetch_add(1);
-    numNodes.fetch_add(1);
-    nodes->wKINGSIDE_CASTLE = d->wKINGSIDE_CASTLE;
-    nodes->wQUEENSIDE_CASTLE = d->wQUEENSIDE_CASTLE;
-    nodes->bKINGSIDE_CASTLE = d->bKINGSIDE_CASTLE;
-    nodes->bQUEENSIDE_CASTLE = d->bQUEENSIDE_CASTLE;
-    nodes->EN_PASSANT_FILE = d->EN_PASSANT_FILE;
-    nodes->FIFTY_MOVE_COUNTER = d->FIFTY_MOVE_COUNTER;
-    nodes->wKING_SQUARE = d->wKING_SQUARE;
-    nodes->bKING_SQUARE = d->bKING_SQUARE;
-    nodes->SQUARE_FROM = d->SQUARE_FROM;
-    nodes->SQUARE_TO = d->SQUARE_TO;
-    nodes->PLAYER_TURN = d->PLAYER_TURN;
-    nodes->GAME_STATE = d->GAME_STATE;
-
-    nodes->parentIndex = UNDEFINED;
-    nodes->numChildren = 0;
-    nodes->childStartIndex = UNDEFINED;
-    nodes->numMoves = UNDEFINED;
-    nodes->moveStartIndex = UNDEFINED;
-    nodes->e.store(0.0); // This will get updated when examining the root.
-    nodes->score = ROOT_SCORE;
-
-    // Get all moves from the root into the main thread's childPool and then into the node and global arrays.
-    examineAllSemilegalMoves(threads, 0, 0);
-
-    if (multithread) {
-        // Run the main thread for a relatively short time.
-        threads->run.store(1);
-        evaluatePositionReps(threads, numSeedReps);
-        threads->run.store(0);
-
-        // Distribute the queued nodes in the main thread's queue equally among threads.
-        T* t = threads; // Main thread
-        int i = 1; // Start at first non-main thread.
-        while (t->futuresQueueSize != 0) {
-            int x = getFirstFuture(t);
-            addFutureQueue(threads + i, x);
-            i = (i % (numThreads - 1)) + 1; // Cycle threads from 1 to numThreads - 1.
-        }
-    }
-
-    setupComplete = 1;
-    return 1;
-}
-
-// Function called with a thread until we close the thread (can persist over multiple position evaluations).
-void runThread(int id) {
-    
-    // Keep evaluating or waiting until init() is called and the threads are killed.
-    while (1) {
-        if (!(threads[id].live.load())) break;
-        if (threads[id].run.load()) {
-            if (evaluatePositionInfinite(threads + id)) {
-                // If the evaluation is finished, stop this thread.
-                threads[id].run.store(0);
-            }
-        }
-        else {
-            if (threads[id].running.load()) {
-                threads[id].running.store(0);
-                numThreadsRunning.fetch_add(-1);
-            }
-        }
-    }
-}
-
-// Copy and sort the choices of moves from the root node. Root must be created (nodes != 0) before calling this.
-void getSortedChoices() {
-    int numChoices = nodes->numChildren;
-    sortedMoves = (N**)realloc(sortedMoves, numChoices * sizeof(N*));
-
-    int c = nodes->childStartIndex; // should be 1
-    for (int i = 0; i < numChoices; i++) {
-        sortedMoves[i] = nodes + c + i;
-    }
-
-    bool playerTurn = nodes->PLAYER_TURN;
-
-    // Sort the choices using insertion sort.
-    for (int i = 1; i < numChoices; i++) {
-
-        N* n = sortedMoves[i];
-        eval e = n->e.load();
-        int j = i - 1;
-
-        eval je = sortedMoves[j]->e.load();
-        while (((playerTurn) && je > e || (!playerTurn) && je < e)) {
-            sortedMoves[j + 1] = sortedMoves[j];
-            j--;
-            if (j < 0) break;
-            je = sortedMoves[j]->e.load();
-        }
-
-        sortedMoves[j + 1] = n;
-    }
-}
-
-// Master global evaluation function called after init() and setupEvaluation().
-bool evaluateStart() {
-
-    if (!setupComplete) return 0;
-
-    // Start running the threads.
-    numThreadsRunning.store(numThreads - 1);
-    for (int i = 1; i < numThreads; i++) {
-        threads[i].run.store(1);
-        threads[i].running.store(1);
-    }
-
-    return 1;
-}
-
-// Master global evaluation function called after init() and setupEvaluation().
-bool evaluateStop() {
-
-    // Stop running the threads.
-    for (int i = 1; i < numThreads; i++) {
-        threads[i].run.store(0);
-    }
-
-    // Wait for all of them to stop here so we don't call a different function at this time.
-    while (numThreadsRunning.load() != 0) {}
-
-    getSortedChoices(); // This will get called at the end of every evaluation.
-
-    return 1;
-}
-
-// Master global evaluation function called after init() and setupEvaluation().
-bool evaluateTime(double t) {
-    evaluateStart();
-    if (!setupComplete) return 0;
-
-    struct timespec start;
-    timespec_get(&start, TIME_UTC);
-    long long s = start.tv_sec;
-    long long ns = start.tv_nsec;
-
-    // Wait until time.
-    struct timespec now;
-    while (1) {
-        timespec_get(&now, TIME_UTC);
-
-        long long diff = ((long long)now.tv_sec - s) * 1000000000ll + ((long long)now.tv_nsec - ns);
-        if ((double)diff >= t * 1000000000.0) {
-            break;
-        }
-    }
-
-    evaluateStop();
-
-    return 1;
-}
-
-// End the thread function for each thread.
-void killAllThreads() {
-
-    // Ask the threads to stop.
-    for (int i = 1; i < numThreads; i++) {
-        threads[i].live.store(0);
-        threads[i].run.store(0);
-    }
-
-    // Wait until all threads have stopped.
-    while (numThreadsAlive.load() > 0) {}
-
-    for (int i = 1; i < numThreads; i++) {
-        if (threads[i].thr.joinable()) {
-            threads[i].thr.join();
-        }
-    }
-}
-
-// Make a thread stop calculating temporarily.
-void stopAllThreads() {
-    // Ask the threads to stop.
-    for (int i = 1; i < numThreads; i++) {
-        threads[i].run.store(0);
-    }
-
-    // Wait until all threads have stopped.
-    while (numThreadsRunning.load() > 0) {}
-}
-
-// Initialize the engine by configuring settings and allocating position memory.
-// This must be called at the start of this application and when other apps run this app.
-// Can also be called during and between position examinations to change the memory allowed and number of threads.
-// totalNumNodesAllowed should be moderately large (suggested: 5 million) as we use sizeof(N) + sizeof(int) = 48 + 4 = 52 bytes per move.
-// totalNumMovesAllowed should be very large (suggested: 100 million) as we use 2 bytes per move.
-bool init(int totalNumNodesAllowed, int totalNumMovesAllowed, int threadCount) {
-
-    // Return early (do not enable initComplete) if bad parameters.
-    if (totalNumNodesAllowed < 1000 || totalNumNodesAllowed > 2000000000) return 0;
-    if (totalNumMovesAllowed < 1000 || totalNumMovesAllowed > 2000000000) return 0;
-    if (threadCount < 2 || threadCount > 100) return 0;
-
-    setupComplete = 0;
-
-    killAllThreads();
-
-    numThreads = threadCount;
-
-    // Split the nodes up equally into threads.
-    int queueSizePerThread = totalNumNodesAllowed / threadCount;
-
-    // Generate the threads.
-    clear(threads);
-    threads = (T*)calloc(numThreads, sizeof(T));
-
-    for (int i = 0; i < numThreads; i++) {
-        T* t = threads + i;
-
-        // Allocate memory in the queue while making it empty.
-        #if USE_SCORE_BUCKETS
-            // Ensure the first bucket insertion sets the new lowest bucket index.
-            t->lowestBucketIndex = INT_MAX;
-
-            // Allocate memory in the bucket list while making it empty.
-            if (t->buckets == NULL) {
-                t->buckets = (int**)calloc(numBuckets, sizeof(int*));
-                t->bucketCap = (int*)calloc(numBuckets, 4);
-                t->bucketLength = (int*)calloc(numBuckets, 4);
-            }
-            int bucketSize = queueSizePerThread / numBuckets;
-            int** b = t->buckets;
-            int* bc = t->bucketCap;
-            for (int j = 0; j < numBuckets; j++) {
-                b[j] = (int*)realloc(b[j], bucketSize * 4); // Assume buckets are equally used and all nodes can be in the queue at once.
-                bc[j] = bucketSize;
-            }
-        #else
-            // Allocate memory in the heap while making it empty.
-            t->futuresHeap = (int*)realloc(t->futuresHeap, queueSizePerThread * 4);
-            t->futuresHeapCap = queueSizePerThread;
-        #endif
-
-        // No need to set anything in those nodes.
-
-        t->childPoolLength = 0;
-
-        // Allocate moves.
-        t->moves = (M*)realloc(t->moves, sizeof(M) * MAX_DEPTH);
-    }
-
-    // Allocate global nodes.
-    nodes = (N*)realloc(nodes, totalNumNodesAllowed * sizeof(N));
-    numNodes.store(0);
-    nodeCap.store(totalNumNodesAllowed);
-
-    // Allocate global moves.
-    globalMoveFrom = (char*)realloc(globalMoveFrom, totalNumMovesAllowed);
-    globalMoveTo = (char*)realloc(globalMoveTo, totalNumMovesAllowed);
-    globalMoveLength.store(0);
-    globalMoveCap.store(totalNumMovesAllowed);
-
-    // Start all threads.
-    for (int i = 1; i < numThreads; i++) {
-        threads[i].live.store(1);
-        threads[i].thr = thread(runThread, i);
-    }
-
-    initComplete = 1;
-    return 1;
 }
 
 // Read a string from console.
@@ -3778,13 +3235,158 @@ double getNumber(double lowerBound, double upperBound, bool allowDecimal) {
                 else {
                     printf("Input integer must be in the range [%i, %i]: ", (int)lowerBound, (int)upperBound);
                 }
-                
+
                 invalid = 1;
             }
         }
     }
 
     return x;
+}
+
+// Prepare to evaluate a position, making a deep copy of the given position.
+bool setupEvaluation(position* pos, W* w, bool multithread) {
+
+    if (!initComplete) return 0;
+
+    currentWeights = w;
+
+    // Clear the tree.
+    numNodes.store(0);
+    nodeCapReached.store(0);
+
+    // Reset the calc statistics.
+    resetCalcStats();
+
+    rootPosition = *pos;
+
+    // Construct the root node (nodes[0]) from the given data.
+    calcNumNodesAdded.fetch_add(1);
+    numNodes.fetch_add(1);
+
+    nodes->moveFrom = UNDEFINED;
+    nodes->moveTo = UNDEFINED;
+    nodes->numChildren = 0;
+    nodes->childStartIndex = UNDEFINED;
+    nodes->e = 0.0; // This will get updated when examining the root.
+    nodes->cost = 0;
+
+    // Get all moves from the root.
+    // This ensures that if we do not evaluate or evaluation goes wrong, we at least know what the legal moves are.
+    threads->nodePathLength = 1;
+    threads->nodePathIndices[0] = 0;
+    examineLeaf(threads);
+
+    setupComplete = 1;
+    return 1;
+}
+
+// Function called with a thread until we close the thread (can persist over multiple position evaluations).
+void runThread(int id) {
+    T* t = threads + id;
+    
+    // Keep evaluating until init() is called and the threads are killed.
+    for (int i = 0;; i++) {
+
+        // Checking if we should evaluate.
+        struct timespec now;
+        timespec_get(&now, TIME_UTC);
+        unsigned long long time = getTime();
+        if (time >= endTime) {
+            continue;
+        }
+        if (calcNumNodesAdded.load() >= nodeAddLimit) {
+            continue;
+        }
+        if (calcNumNodesExamined.load() >= nodeExamineLimit) {
+            continue;
+        }
+
+        if (nodeCapReached) continue;
+        searchCycle(t);
+    }
+}
+
+// End the thread function for each thread.
+void killAllThreads() {
+
+    // Ask the threads to stop.
+    for (int i = 1; i < numThreads; i++) {
+        killThreads.store(1);
+    }
+
+    // Wait until all threads have exited their runThread() function.
+    while (numThreadsAlive.load() > 0) {}
+
+    // Join all threads.
+    for (int i = 1; i < numThreads; i++) {
+        if (threads[i].thr.joinable()) {
+            threads[i].thr.join();
+        }
+    }
+}
+
+void startEvaluation(int timeLimitMS, int addLimit, int examineLimit) {
+    nodeAddLimit = addLimit;
+    nodeExamineLimit = examineLimit;
+    endTime = getTime() + (unsigned long long)timeLimitMS * 1000000ull;
+}
+
+void stopEvaluation() {
+    endTime = 0;
+}
+
+void waitEvaluation(int timeLimitMS, int addLimit, int examineLimit) {
+    if (!setupComplete) {
+        return;
+    }
+    startEvaluation(timeLimitMS, addLimit, examineLimit);
+    while (getTime() < endTime) {}
+    stopEvaluation();
+    getSortedChoices();
+}
+
+// Initialize the engine by configuring settings and allocating position memory.
+// This must be called at the start of this application and when other apps run this app.
+// Can also be called during and between position examinations to change the memory allowed and number of threads.
+// totalNumNodesAllowed should be very large (suggested: 20 million) as we use sizeof(node) = 20 bytes per node.
+bool init(int totalNumNodesAllowed, int threadCount) {
+
+    // Return early (do not enable initComplete) if bad parameters.
+    if (totalNumNodesAllowed < 1000 || totalNumNodesAllowed > 2000000000) return 0;
+    if (threadCount < 2 || threadCount > 100) return 0;
+
+    setupComplete = 0;
+
+    killAllThreads();
+
+    numThreads = threadCount;
+
+    // Generate the threads.
+    clear(threads);
+    threads = (T*)calloc(numThreads, sizeof(T));
+
+    for (int i = 0; i < numThreads; i++) {
+        T* t = threads + i;
+        t->nodePathLength = 0;
+        t->childPoolLength = 0;
+        t->hasPath.store(0);
+    }
+
+    // Allocate global nodes.
+    nodes = (node*)realloc(nodes, totalNumNodesAllowed * sizeof(node));
+    numNodes.store(0);
+    nodeCap.store(totalNumNodesAllowed);
+
+    // Start all threads.
+    killThreads.store(0);
+    numThreadsAlive.store(numThreads - 1);
+    for (int i = 1; i < numThreads; i++) {
+        threads[i].thr = thread(runThread, i);
+    }
+
+    initComplete = 1;
+    return 1;
 }
 
 bool isPiece(char c) {
@@ -3877,8 +3479,9 @@ char pieceCharToType(char c, bool isBlackMove) {
 // Get the first possible movefrom square of the piece moving to a given board square.
 // Row and col restrict the movefrom square. They can specify a value or can be -1 for any value.
 // Returns -127 if no possible movefrom square.
-char getPieceMoving(char* b, D* d, char piece, char t, char row, char col) {
-    char type = pieceCharToType(piece, d->PLAYER_TURN);
+char getPieceMoving(position* pos, char piece, char t, char row, char col) {
+    char* b = pos->board;
+    char type = pieceCharToType(piece, pos->PLAYER_TURN);
     if (type == -1) {
         return -127;
     }
@@ -3900,7 +3503,7 @@ char getPieceMoving(char* b, D* d, char piece, char t, char row, char col) {
             if (b[f] != type) continue;
 
             // Check if the given piece can move from f to t.
-            if (isLegalMove(b, d, f, t)) {
+            if (isLegalMove(pos, f, t)) {
                 return f;
             }
         }
@@ -3909,151 +3512,6 @@ char getPieceMoving(char* b, D* d, char piece, char t, char row, char col) {
     return -127;
 }
 
-// Get the square for a square index in human-readable format.
-char* getSquareHuman(char x) {
-
-    if (x < 0) {
-        char* o = (char*)calloc(3, 1);
-        o[0] = '?';
-        o[1] = '?';
-        o[2] = '\0';
-        return o;
-    }
-
-    if (x >= 64) {
-        char* o = (char*)calloc(4, 1);
-        o[0] = 'a' + (x % 8);
-        o[1] = x >= 96 ? '1' : '8';
-        char promotionRow = (x % 32) / 8;
-        switch (promotionRow) {
-        case 0:
-            o[2] = 'N'; break;
-        case 1:
-            o[2] = 'B'; break;
-        case 2:
-            o[2] = 'R'; break;
-        case 3:
-            o[2] = 'Q'; break;
-        }
-        o[3] = '\0';
-        return o;
-    }
-
-    char* o = (char*)calloc(3, 1);
-    o[0] = 'a' + (x % 8);
-    o[1] = '1' + (x / 8);
-    o[2] = '\0';
-    return o;
-}
-
-// Get a string for a root move in human-readable format.
-char* moveToString(int i) {
-
-    N* n = sortedMoves[i];
-    char* b = threads->cb;
-    char f = n->SQUARE_FROM;
-    char t = n->SQUARE_TO;
-    char p = b[f];
-    
-    char* o;
-
-    if (p == wKING && f == 4 && t == 6 || p == bKING && f == 60 && t == 62) {
-        o = (char*)calloc(4, 1);
-        o[0] = '0';
-        o[1] = '-';
-        o[2] = '0';
-        o[3] = '\0';
-        return o;
-    }
-    if (p == wKING && f == 4 && t == 2 || p == bKING && f == 60 && t == 58) {
-        o = (char*)calloc(6, 1);
-        o[0] = '0';
-        o[1] = '-';
-        o[2] = '0';
-        o[3] = '-';
-        o[4] = '0';
-        o[5] = '\0';
-        return o;
-    }
-
-    int l = 5, s = 0;
-    if (p != wPAWN && p != bPAWN) {
-        l++;
-        s++;
-    }
-
-    if (t >= 64) {
-        // If the move is a promotion, add the promotion piece letter at the end.
-        l++;
-        o = (char*)calloc(l, 1);
-
-        switch ((t % 32) / 8) {
-        case 0:
-            o[l - 2] = 'N'; break;
-        case 1:
-            o[l - 2] = 'B'; break;
-        case 2:
-            o[l - 2] = 'R'; break;
-        case 3:
-            o[l - 2] = 'Q'; break;
-        }
-
-        // Set the destination to the true destination of the promotion.
-        if (t >= 96) {
-            t %= 8;
-        }
-        else {
-            t = 56 + (t % 8);
-        }
-    }
-    else {
-        o = (char*)calloc(l, 1);
-    }
-
-    // Indicate the moving piece if it is not a pawn.
-    switch (p) {
-    case EMPTY:
-        o[0] = '?'; break;
-    case wKNIGHT:
-    case bKNIGHT:
-        o[0] = 'N'; break;
-    case wBISHOP:
-    case bBISHOP:
-        o[0] = 'B'; break;
-    case wROOK:
-    case bROOK:
-        o[0] = 'R'; break;
-    case wQUEEN:
-    case bQUEEN:
-        o[0] = 'Q'; break;
-    case wKING:
-    case bKING:
-        o[0] = 'K'; break;
-    }
-
-    // Indicate the square we are moving from.
-    if (f < 0 || f >= 64) {
-        o[s] = '?';
-        o[s + 1] = '?';
-    }
-    else {
-        o[s] = 'a' + (f % 8);
-        o[s + 1] = '1' + (f / 8);
-    }
-
-    // Indicate the square we are moving to.
-    if (t < 0 || t >= 64) {
-        o[s + 2] = '?';
-        o[s + 3] = '?';
-    }
-    else {
-        o[s + 2] = 'a' + (t % 8);
-        o[s + 3] = '1' + (t / 8);
-    }
-
-    o[l - 1] = '\0';
-    return o;
-}
 // Get the encoded promotion square given the promotion column and the type being promoted to.
 char getPromotionSquareCode(char col, char type) {
     if (type >= 7 && type <= 11) {
@@ -4069,10 +3527,11 @@ char getPromotionSquareCode(char col, char type) {
 
 // Parse a user-entered string containing a move and set movefrom and moveto.
 // Make the move and return whether the move is fully legal.
-bool parseMove(char* b, D* d, char* s, int l) {
-    char playerTurn = d->PLAYER_TURN;
-    char* f = &(d->SQUARE_FROM);
-    char* t = &(d->SQUARE_TO);
+bool parseMove(position* pos, char* s, int l) {
+    char* b = pos->board;
+    char playerTurn = pos->PLAYER_TURN;
+    char* f = &(pos->SQUARE_FROM);
+    char* t = &(pos->SQUARE_TO);
     *f = -128; *t = -128;
 
     switch (l) {
@@ -4083,7 +3542,7 @@ bool parseMove(char* b, D* d, char* s, int l) {
             *t = (s[1] - '1') * 8 + s[0] - 'a';
             if (playerTurn) {
                 if (*t >= 56) {
-                    printf("No black pawn can move to %s: ", getSquareHuman(*t));
+                    printf("No black pawn can move to %s: ", squareToString(*t));
                     *f = -126;
                 }
                 else if (b[*t + 8] == 6) {
@@ -4093,13 +3552,13 @@ bool parseMove(char* b, D* d, char* s, int l) {
                     *f = *t + 16;
                 }
                 else {
-                    printf("No black pawn can move to %s: ", getSquareHuman(*t));
+                    printf("No black pawn can move to %s: ", squareToString(*t));
                     *f = -126;
                 }
             }
             else {
                 if (*t < 8) {
-                    printf("No white pawn can move to %s: ", getSquareHuman(*t));
+                    printf("No white pawn can move to %s: ", squareToString(*t));
                     *f = -126;
                 }
                 else if (b[*t - 8] == 0) {
@@ -4109,7 +3568,7 @@ bool parseMove(char* b, D* d, char* s, int l) {
                     *f = *t - 16;
                 }
                 else {
-                    printf("No white pawn can move to %s: ", getSquareHuman(*t));
+                    printf("No white pawn can move to %s: ", squareToString(*t));
                     *f = -126;
                 }
             }
@@ -4127,7 +3586,7 @@ bool parseMove(char* b, D* d, char* s, int l) {
         // Piece move (Ne4)
         if (isPiece(s[0]) && isAH(s[1]) && is18(s[2])) {
             *t = (s[2] - '1') * 8 + s[1] - 'a';
-            *f = getPieceMoving(b, d, s[0], *t, -1, -1);
+            *f = getPieceMoving(pos, s[0], *t, -1, -1);
         }
 
         // Queenside (000)
@@ -4142,22 +3601,22 @@ bool parseMove(char* b, D* d, char* s, int l) {
             if (playerTurn) {
                 *f = (s[2] - '0') * 8 + s[0] - 'a';
                 if (*t >= 56 || *t < 8) {
-                    printf("No black pawn can capture to %s: ", getSquareHuman(*t));
+                    printf("No black pawn can capture to %s: ", squareToString(*t));
                     *f = -126;
                 }
                 else if (b[*f] != bPAWN) {
-                    printf("No black pawn can capture to %s: ", getSquareHuman(*t));
+                    printf("No black pawn can capture to %s: ", squareToString(*t));
                     *f = -126;
                 }
             }
             else {
                 *f = (s[2] - '2') * 8 + s[0] - 'a';
                 if (*t >= 56 || *t < 8) {
-                    printf("No white pawn can capture to %s: ", getSquareHuman(*t));
+                    printf("No white pawn can capture to %s: ", squareToString(*t));
                     *f = -126;
                 }
                 else if (b[*f] != wPAWN) {
-                    printf("No white pawn can capture to %s: ", getSquareHuman(*t));
+                    printf("No white pawn can capture to %s: ", squareToString(*t));
                     *f = -126;
                 }
             }
@@ -4173,28 +3632,28 @@ bool parseMove(char* b, D* d, char* s, int l) {
             else if (playerTurn) {
                 *f = 8 + s[0] - 'a';
                 if (s[1] != '1') {
-                    printf("No black pawn can promote to %s%c: ", getSquareHuman(*t), s[2]);
+                    printf("No black pawn can promote to %s%c: ", squareToString(*t), s[2]);
                     *f = -126;
                 }
                 else if (b[*f] == bPAWN) {
 
                 }
                 else {
-                    printf("No black pawn can promote to %s%c: ", getSquareHuman(*t), s[2]);
+                    printf("No black pawn can promote to %s%c: ", squareToString(*t), s[2]);
                     *f = -126;
                 }
             }
             else {
                 *f = 48 + s[0] - 'a';
                 if (s[1] != '8') {
-                    printf("No white pawn can promote to %s%c: ", getSquareHuman(*t), s[2]);
+                    printf("No white pawn can promote to %s%c: ", squareToString(*t), s[2]);
                     *f = -126;
                 }
                 else if (b[*f] == wPAWN) {
 
                 }
                 else {
-                    printf("No white pawn can promote to %s%c: ", getSquareHuman(*t), s[2]);
+                    printf("No white pawn can promote to %s%c: ", squareToString(*t), s[2]);
                     *f = -126;
                 }
             }
@@ -4212,13 +3671,13 @@ bool parseMove(char* b, D* d, char* s, int l) {
         // Piece move with row (N3e4)
         if (isPiece(s[0]) && is18(s[1]) && isAH(s[2]) && is18(s[3])) {
             *t = (s[3] - '1') * 8 + s[2] - 'a';
-            *f = getPieceMoving(b, d, s[0], *t, s[1] - '1', -1);
+            *f = getPieceMoving(pos, s[0], *t, s[1] - '1', -1);
         }
 
         // Piece move with column (Nce4)
         if (isPiece(s[0]) && isAH(s[1]) && isAH(s[2]) && is18(s[3])) {
             *t = (s[3] - '1') * 8 + s[2] - 'a';
-            *f = getPieceMoving(b, d, s[0], *t, -1, s[1] - 'a');
+            *f = getPieceMoving(pos, s[0], *t, -1, s[1] - 'a');
         }
 
         // Pawn capture promotion (de8Q)
@@ -4238,7 +3697,7 @@ bool parseMove(char* b, D* d, char* s, int l) {
 
                 }
                 else {
-                    printf("No black pawn can capture to %s: ", getSquareHuman(*t));
+                    printf("No black pawn can capture to %s: ", squareToString(*t));
                     *f = -126;
                 }
             }
@@ -4252,7 +3711,7 @@ bool parseMove(char* b, D* d, char* s, int l) {
 
                 }
                 else {
-                    printf("No white pawn can capture to %s: ", getSquareHuman(*t));
+                    printf("No white pawn can capture to %s: ", squareToString(*t));
                     *f = -126;
                 }
             }
@@ -4265,7 +3724,7 @@ bool parseMove(char* b, D* d, char* s, int l) {
         // Piece move with both (Nc3e4)
         if (isPiece(s[0]) && isAH(s[1]) && is18(s[2]) && isAH(s[3]) && is18(s[4])) {
             *t = (s[4] - '1') * 8 + s[3] - 'a';
-            *f = getPieceMoving(b, d, s[0], *t, s[2] - '1', s[1] - 'a');
+            *f = getPieceMoving(pos, s[0], *t, s[2] - '1', s[1] - 'a');
         }
 
         // From-to pawn promotion (d7e8Q)
@@ -4287,11 +3746,11 @@ bool parseMove(char* b, D* d, char* s, int l) {
     case -126: // Miscellaneous problem
         return 0;
     default:
-        if (isLegalMove(b, d, *f, *t)) {
+        if (isLegalMove(pos, *f, *t)) {
             return 1;
         }
         else {
-            printf("Move from %s to %s is illegal: ", getSquareHuman(*f), getSquareHuman(*t));
+            printf("Move from %s to %s is illegal: ", squareToString(*f), squareToString(*t));
             return 0;
         }
     }
@@ -4300,8 +3759,8 @@ bool parseMove(char* b, D* d, char* s, int l) {
 
 // Gets a move from the user and records the movefrom and moveto in the given parameter when legal.
 // Repeats until the move is fully legal on the given parameters.
-bool playerChooseMove(char* b, D* d) {
-    char playerTurn = d->PLAYER_TURN;
+bool playerChooseMove(position* pos) {
+    char playerTurn = pos->PLAYER_TURN;
 
     printf("Enter a move for ");
     playerTurn == BLACK ? printf("Black: ") : printf("White: ");
@@ -4313,29 +3772,12 @@ bool playerChooseMove(char* b, D* d) {
             return 0;
         }
 
-        bool legal = parseMove(b, d, moveString, moveStringLength);
+        bool legal = parseMove(pos, moveString, moveStringLength);
         if (legal) {
             return 1;
         }
     }
     return 1;
-}
-
-void printEval(eval e) {
-    if (e >= WHITE_WINS_EVAL_THRESHOLD) {
-        printf("+M%i", WHITE_WINS_EVAL - e);
-    } else if (e <= BLACK_WINS_EVAL_THRESHOLD) {
-        printf("-M%i", e - BLACK_WINS_EVAL);
-    } else if (e > 0) {
-        if (usePlusesOnEvalNumbers) {
-            printf("+");
-        }
-        printf("%i", e / 100);
-        printf(".%i%i", (e / 10) % 10, e % 10);
-    } else {
-        printf("%i", e / 100);
-        printf(".%i%i", (-e / 10) % 10, -e % 10);
-    }
 }
 
 // Choose a move using the evals and difficulty (from DIFFICULTY_MIN to DIFFICULTY_MAX).
@@ -4348,12 +3790,12 @@ int chooseMove(eval maxEvalLossAllowed) {
     if (evaluationPrintChoices) {
         if (numChoices > 0) {
             printf("%i choices with best eval (current position eval) ", numChoices);
-            printEval(sortedMoves[0]->e.load());
+            printEval(sortedMoves[0]->e);
             printf(":\n");
             for (int i = 0; i < numChoices; i++) {
-                printf(moveToString(i));
+                printf(moveToString(i, history + gameLength - 1));
                 printf("\t");
-                printEval(sortedMoves[0]->e.load());
+                printEval(sortedMoves[0]->e);
                 printf("\n");
             }
         }
@@ -4365,10 +3807,10 @@ int chooseMove(eval maxEvalLossAllowed) {
     if (numChoices <= 0) return -1;
 
     // Get the number of good moves to choose from depending on the engine difficulty.
-    eval best = sortedMoves[0]->e.load();
+    eval best = sortedMoves[0]->e;
     int numActualChoices = numChoices;
     for (int i = 1; i < numChoices; i++) {
-        eval e = sortedMoves[i]->e.load();
+        eval e = sortedMoves[i]->e;
         if ((int)e - (int)best > (int)maxEvalLossAllowed || (int)best - (int)e > (int)maxEvalLossAllowed) {
             numActualChoices = i;
             break;
@@ -4380,22 +3822,27 @@ int chooseMove(eval maxEvalLossAllowed) {
 }
 
 // Return the number of legal moves in a position.
-// This is done by examining all moves with a new thread and node.
-int numMoves(char* b, D* d) {
-    N n;
-    n.wKINGSIDE_CASTLE = d->bKINGSIDE_CASTLE;
-    n.wQUEENSIDE_CASTLE = d->wQUEENSIDE_CASTLE;
-    n.bKINGSIDE_CASTLE = d->bKINGSIDE_CASTLE;
-    n.bQUEENSIDE_CASTLE = d->bQUEENSIDE_CASTLE;
-    n.EN_PASSANT_FILE = d->EN_PASSANT_FILE;
-    n.wKING_SQUARE = d->wKING_SQUARE;
-    n.bKING_SQUARE = d->bKING_SQUARE;
-    n.PLAYER_TURN = d->PLAYER_TURN;
-    T t; // childPool and eval data will get reset by examinePieces.
+// This is done by examining all moves with a copy of the position.
+int numMoves(position* p) {
+    // Create a copy of the position to examine pieces with.
+    // childPool and eval data will get reset by examinePieces, so there is no need to set them here.
+    T t;
     for (int i = 0; i < 64; i++) {
-        t.cb[i] = b[i];
+        t.pos.board[i] = p->board[i];
     }
-    examinePieces(&t, &n);
+    t.pos.wKINGSIDE_CASTLE = p->wKINGSIDE_CASTLE;
+    t.pos.wQUEENSIDE_CASTLE = p->wQUEENSIDE_CASTLE;
+    t.pos.bKINGSIDE_CASTLE = p->bKINGSIDE_CASTLE;
+    t.pos.bQUEENSIDE_CASTLE = p->bQUEENSIDE_CASTLE;
+    t.pos.EN_PASSANT_FILE = p->EN_PASSANT_FILE;
+    t.pos.FIFTY_MOVE_COUNTER = p->FIFTY_MOVE_COUNTER;
+    t.pos.wKING_SQUARE = p->wKING_SQUARE;
+    t.pos.bKING_SQUARE = p->bKING_SQUARE;
+    t.pos.SQUARE_FROM = p->SQUARE_FROM;
+    t.pos.SQUARE_TO = p->SQUARE_TO;
+    t.pos.PLAYER_TURN = p->PLAYER_TURN;
+    t.pos.GAME_STATE = p->GAME_STATE;
+    examinePieces(&t);
     return t.childPoolLength;
 }
 
@@ -4404,7 +3851,7 @@ int minimumSufficientPieceCounts[NUM_PIECES] = { 1, 2, 2, 1, 1, 0, 1, 2, 2, 1, 1
 // Return 1 if neither player has the material to checkmate.
 bool checkInsufficientMatingMaterial() {
     bool whiteMinorPiece = 0, blackMinorPiece = 0;
-    char* b = history[gameLength - 1];
+    char* b = history[gameLength - 1].board;
 
     for (int i = 0; i < 64; i++) {
         switch (b[i]) {
@@ -4434,16 +3881,15 @@ bool checkInsufficientMatingMaterial() {
 // Check the game position for 50-move rule, insufficient mating material, and threefold repetition draws.
 // Return 1 if ending the game in a draw.
 bool checkDrawsEngine() {
-    D* ld = historyD + gameLength - 1;
-    return ld->FIFTY_MOVE_COUNTER >= 100 || checkInsufficientMatingMaterial() || checkThreefoldRepetition();
+    position* pos = history + gameLength - 1;
+    return pos->FIFTY_MOVE_COUNTER >= 100 || checkInsufficientMatingMaterial() || checkThreefoldRepetition();
 }
 
 // Check the game position for 50-move rule, insufficient mating material, and threefold repetition draws.
 // Return 1 if ending the game in a draw.
 bool checkDraws() {
-
-    D* ld = historyD + gameLength - 1;
-    if (ld->FIFTY_MOVE_COUNTER >= 100) {
+    position* pos = history + gameLength - 1;
+    if (pos->FIFTY_MOVE_COUNTER >= 100) {
         if (drawSetting == FORCE) {
             return 1;
         }
@@ -4483,33 +3929,33 @@ bool checkDraws() {
 // Current turn (last index in history) must be at least 1, game length must be at least 2.
 // Return whether to end the game.
 bool playAndCheckEndOfGame(bool engine) {
+    position* pos = history + gameLength - 1;
+    char* b = pos->board;
+    playMoveUpdating(pos);
 
-    D* ld = historyD + gameLength - 1;
-    playMoveDriver(history[gameLength - 1], ld);
-
-    char newPlayerTurn = ld->PLAYER_TURN;
+    char newPlayerTurn = pos->PLAYER_TURN;
 
     // If there are no legal moves, end the game as either checkmate or stalemate.
-    if (numMoves(history[gameLength - 1], ld) == 0) {
+    if (numMoves(pos) == 0) {
         // Find out whether the king of the player whose turn it is after the move is in check.
-        int kingSquare = newPlayerTurn == BLACK ? ld->bKING_SQUARE : ld->wKING_SQUARE;
+        int kingSquare = newPlayerTurn == BLACK ? pos->bKING_SQUARE : pos->wKING_SQUARE;
 
-        if (kingNotInCheck(history[gameLength - 1], kingSquare)) {
+        if (kingNotInCheck(b, kingSquare)) {
             if (!engine) {
-                drawBoard(history[gameLength - 1], newPlayerTurn);
+                drawBoard(b, newPlayerTurn);
                 printf("Stalemate!\n\n");
             }
-            ld->GAME_STATE = DRAW;
+            pos->GAME_STATE = DRAW;
         }
         else {
             if (!engine) {
-                drawBoard(history[gameLength - 1], newPlayerTurn);
+                drawBoard(b, newPlayerTurn);
                 printf("Checkmate!\n");
             }
-            if (ld->PLAYER_TURN == BLACK) {
-                ld->GAME_STATE = WHITE_WIN;
+            if (pos->PLAYER_TURN == BLACK) {
+                pos->GAME_STATE = WHITE_WIN;
             }else{
-                ld->GAME_STATE = BLACK_WIN;
+                pos->GAME_STATE = BLACK_WIN;
             }
         }
         return 1;
@@ -4517,17 +3963,17 @@ bool playAndCheckEndOfGame(bool engine) {
 
     if (engine) {
         if (checkDrawsEngine()) {
-            ld->GAME_STATE = DRAW;
+            pos->GAME_STATE = DRAW;
             return 1;
         }
     }else{
         if (checkDraws()) {
-            ld->GAME_STATE = DRAW;
+            pos->GAME_STATE = DRAW;
             return 1;
         }
     }
 
-    ld->GAME_STATE = NORMAL;
+    pos->GAME_STATE = NORMAL;
     return 0;
 }
 
@@ -4541,7 +3987,7 @@ char setFENBoard(char* b, int x, char piece) {
 // Get input and parse the FEN code stored in inLine and return 1 if valid.
 // Must handle empty line case (returns 0) outside this function.
 // Parameters must be the allocated board and data, which get cleared and replaced with the FEN data.
-bool parseFEN(char* b, D* d) {
+bool parseFEN(position* pos) {
     getLine();
 
     if (inLine[0] == '\n' || inLine[0] == '\0') {
@@ -4572,21 +4018,22 @@ bool parseFEN(char* b, D* d) {
     int numBlackKings = 0;
 
     // Set the default board and miscs data in case they do not change.
+    char* b = pos->board;
     for (int i = 0; i < 64; i++) {
         b[i] = EMPTY;
     }
-    d->EN_PASSANT_FILE = -1;
-    d->FIFTY_MOVE_COUNTER = 0;
-    d->SQUARE_FROM = UNDEFINED;
-    d->SQUARE_TO = UNDEFINED;
-    d->GAME_STATE = NORMAL; // TODO: DECIDE WHAT TO MAKE THIS IF THERE IS EVIDENTLY A CHECKMATE/STALEMATE
+    pos->EN_PASSANT_FILE = -1;
+    pos->FIFTY_MOVE_COUNTER = 0;
+    pos->SQUARE_FROM = UNDEFINED;
+    pos->SQUARE_TO = UNDEFINED;
+    pos->GAME_STATE = NORMAL;
 
     // Parse the piece locations on the board.
     int x = 0;
-    int pos = 0;
-    for (;; pos++) {
+    int i = 0;
+    for (;; i++) {
         if (x >= 64) break;
-        switch (inLine[pos]) {
+        switch (inLine[i]) {
 
         case '\n':
         case '\0':
@@ -4609,7 +4056,7 @@ bool parseFEN(char* b, D* d) {
             setFENBoard(b, x++, wQUEEN);
             break;
         case 'K':
-            d->wKING_SQUARE = setFENBoard(b, x++, wKING);
+            pos->wKING_SQUARE = setFENBoard(b, x++, wKING);
             numWhiteKings++;
             break;
 
@@ -4629,14 +4076,14 @@ bool parseFEN(char* b, D* d) {
             setFENBoard(b, x++, bQUEEN);
             break;
         case 'k':
-            d->bKING_SQUARE = setFENBoard(b, x++, bKING);
+            pos->bKING_SQUARE = setFENBoard(b, x++, bKING);
             numBlackKings++;
             break;
 
         default:
-            // Numbers indicate that many empty consecutive board spaces.
-            if (inLine[pos] >= '0' && inLine[pos] <= '8') {
-                int c = inLine[pos] - '0';
+            // Numbers indicate consecutive empty board spaces.
+            if (inLine[i] >= '0' && inLine[i] <= '8') {
+                int c = inLine[i] - '0';
                 x += c;
             }
         }
@@ -4655,23 +4102,23 @@ bool parseFEN(char* b, D* d) {
     while (1) {
         bool flag = 0;
 
-        switch (inLine[pos]) {
+        switch (inLine[i]) {
             case '\n':
             case '\0':
                 printf("FEN code ended early at player turn indicator.\n");
                 return 0;
             case 'w':
             case 'W':
-                d->PLAYER_TURN = WHITE;
+                pos->PLAYER_TURN = WHITE;
                 flag = 1;
                 break;
             case 'b':
             case 'B':
-                d->PLAYER_TURN = BLACK;
+                pos->PLAYER_TURN = BLACK;
                 flag = 1;
                 break;
         }
-        pos++;
+        i++;
 
         if (flag) break;
     }
@@ -4679,20 +4126,25 @@ bool parseFEN(char* b, D* d) {
 
     // Assume we can castle if kings and rooks are in the right positions.
     if (b[4] == wKING) {
-        if (b[0] == wROOK) d->wQUEENSIDE_CASTLE = 1;
-        if (b[7] == wROOK) d->wKINGSIDE_CASTLE = 1;
+        if (b[0] == wROOK) pos->wQUEENSIDE_CASTLE = 1;
+        if (b[7] == wROOK) pos->wKINGSIDE_CASTLE = 1;
     }
     if (b[60] == bKING) {
-        if (b[56] == bROOK) d->bQUEENSIDE_CASTLE = 1;
-        if (b[63] == bROOK) d->bKINGSIDE_CASTLE = 1;
+        if (b[56] == bROOK) pos->bQUEENSIDE_CASTLE = 1;
+        if (b[63] == bROOK) pos->bKINGSIDE_CASTLE = 1;
+    }
+
+    if (numMoves(pos) == 0) {
+        printf("There are no legal moves in this FEN code position.\n");
+        return 0;
     }
 
     return 1;
 }
 
 // Get a valid FEN code from the user and return 0 if the user enters a blank line.
-bool getFEN(char* b, D* d) {
-    while (!parseFEN(b, d)) {
+bool getFEN(position* pos) {
+    while (!parseFEN(pos)) {
         if (inLine[0] == '\n' || inLine[0] == '\0') return 0;
         printf("Type a valid FEN code: ");
     }
@@ -4704,26 +4156,18 @@ bool getFEN(char* b, D* d) {
 void copyGamePosition() {
     // Allocate space for this position.
     gameLength++;
-    history = (char**)realloc(history, gameLength * sizeof(char*));
-    historyD = (D*)realloc(historyD, gameLength * sizeof(D));
+    history = (position*)realloc(history, gameLength * sizeof(position));
 
-    history[gameLength - 1] = (char*)calloc(64, 1);
-
-    // Copy the previous board and miscs to this board and miscs.
-    for (int i = 0; i < 64; i++) {
-        history[gameLength - 1][i] = history[gameLength - 2][i];
-    }
-    historyD[gameLength - 1] = historyD[gameLength - 2];
+    history[gameLength - 1] = history[gameLength - 2];
 }
 
 // Have the engine evaluate the last position in the history and choose a move.
 // Store the move in the last position in the history.
-bool engineChooseMove(eval maxEvalLossAllowed, int numSeedReps) {
+bool engineChooseMove(eval maxEvalLossAllowed) {
     double t = evaluationTimeLimitMin + ((double)random() / (double)ULLONG_MAX) * (evaluationTimeLimitMax - evaluationTimeLimitMin);
-    
-    D* ld = historyD + gameLength - 1;
-    setupEvaluation(history[gameLength - 1], ld, &bestWeights, numSeedReps, 1);
-    evaluateTime(t);
+    position* pos = history + gameLength - 1;
+    setupEvaluation(pos, &bestWeights, 1);
+    waitEvaluation((int)t, INT_MAX, INT_MAX);
 
     int choice = chooseMove(maxEvalLossAllowed);
     if (choice == -1) {
@@ -4731,11 +4175,11 @@ bool engineChooseMove(eval maxEvalLossAllowed, int numSeedReps) {
         return 0;
     }
     else {
-        printf("Engine plays %s.\n", moveToString(choice));
+        printf("Engine plays %s.\n", moveToString(choice, pos));
     }
 
-    ld->SQUARE_FROM = sortedMoves[choice]->SQUARE_FROM;
-    ld->SQUARE_TO = sortedMoves[choice]->SQUARE_TO;
+    pos->SQUARE_FROM = sortedMoves[choice]->moveFrom;
+    pos->SQUARE_TO = sortedMoves[choice]->moveTo;
     return 1;
 }
 
@@ -4745,7 +4189,7 @@ void play0Player() {
 
     printf("Enter a starting FEN code or a blank line for the default starting position: ");
     setupBoard();
-    if (!getFEN(history[0], historyD)) {
+    if (!getFEN(history)) {
         setupBoard();
     }
 
@@ -4754,16 +4198,16 @@ void play0Player() {
     eval maxEvalLossAllowed = ((double)(DIFFICULTY_MAX - difficulty) / (double)(DIFFICULTY_MAX - DIFFICULTY_MIN)) * 50;
 
     while (1) {
+        position* pos = history + gameLength - 1;
+        char* b = pos->board;
         clearConsole();
-        drawBoard(history[gameLength - 1], (historyD + gameLength - 1)->PLAYER_TURN);
+        drawBoard(b, pos->PLAYER_TURN);
 
         copyGamePosition();
 
-        D* ld = historyD + gameLength - 1;
-
         // Either engine chooses.
-        if (!engineChooseMove(difficulty, defaultSeedReps)) return;
-        ld->PLAYER_TURN = 1 - (historyD + gameLength - 2)->PLAYER_TURN;
+        if (!engineChooseMove(difficulty)) return;
+        pos->PLAYER_TURN = 1 - (pos + gameLength - 2)->PLAYER_TURN;
 
         if (playAndCheckEndOfGame(0)) break;
     }
@@ -4775,7 +4219,7 @@ void play1Player() {
 
     printf("Enter a starting FEN code or a blank line for the default starting position: ");
     setupBoard();
-    if (!getFEN(history[0], historyD)) {
+    if (!getFEN(history)) {
         setupBoard();
     }
 
@@ -4788,11 +4232,11 @@ void play1Player() {
         return;
     case 'w':
     case 'W':
-        playerRole = 0;
+        playerRole = WHITE;
         break;
     case 'b':
     case 'B':
-        playerRole = 1;
+        playerRole = BLACK;
         break;
     default:
         playerRole = randomRange(0, 1);
@@ -4800,23 +4244,23 @@ void play1Player() {
     }
 
     while (1) {
+        position* pos = history + gameLength - 1;
+        char* b = pos->board;
         clearConsole();
-        drawBoard(history[gameLength - 1], (historyD + gameLength - 1)->PLAYER_TURN);
+        drawBoard(b, pos->PLAYER_TURN);
 
         copyGamePosition();
 
-        D* ld = historyD + gameLength - 1;
-
         // Get the move to play next and store it in historyD.
-        if (playerRole == ld->PLAYER_TURN) {
+        if (playerRole == pos->PLAYER_TURN) {
             // Player chooses.
-            if (!playerChooseMove(history[gameLength - 1], ld)) return;
+            if (!playerChooseMove(pos)) return;
         }
         else {
             // Engine chooses.
-            if(!engineChooseMove(difficulty, defaultSeedReps)) return;
+            if(!engineChooseMove(difficulty)) return;
         }
-        ld->PLAYER_TURN = 1 - (historyD + gameLength - 2)->PLAYER_TURN;
+        pos->PLAYER_TURN = 1 - (pos + gameLength - 2)->PLAYER_TURN;
 
         if (playAndCheckEndOfGame(0)) break;
     }
@@ -4828,21 +4272,21 @@ void play2Player() {
 
     printf("Enter a starting FEN code or a blank line for the default starting position: ");
     setupBoard();
-    if (!getFEN(history[0], historyD)) {
+    if (!getFEN(history)) {
         setupBoard();
     }
 
     while (1) {
+        position* pos = history + gameLength - 1;
+        char* b = pos->board;
         clearConsole();
-        drawBoard(history[gameLength - 1], (historyD + gameLength - 1)->PLAYER_TURN);
+        drawBoard(b, pos->PLAYER_TURN);
 
         copyGamePosition();
 
-        D* ld = historyD + gameLength - 1;
-
         // Either player chooses.
-        if (!playerChooseMove(history[gameLength - 1], ld)) return;
-        ld->PLAYER_TURN = 1 - (historyD + gameLength - 2)->PLAYER_TURN;
+        if (!playerChooseMove(pos)) return;
+        pos->PLAYER_TURN = 1 - (pos + gameLength - 2)->PLAYER_TURN;
 
         if (playAndCheckEndOfGame(0)) break;
     }
@@ -4852,48 +4296,59 @@ void play2Player() {
 void analyzePosition() {
     printf("Enter a position FEN code to analyze: ");
 
-    if (!getFEN(analysisBoard, &analysisD)) {
+    if (!getFEN(&analysisPos)) {
         return;
     }
 
-    bool playerTurn = analysisD.PLAYER_TURN;
-    drawBoard(analysisBoard, playerTurn);
+    bool playerTurn = analysisPos.PLAYER_TURN;
+    char* b = analysisPos.board;
+    drawBoard(b, playerTurn);
 
-    printf("Analyzing for %f seconds...\n\n", evaluationTimeLimitAnalysis);
+    printf("Analyzing for %i ms...\n\n", evaluationTimeLimitAnalysis);
 
-    setupEvaluation(analysisBoard, &analysisD, &bestWeights, defaultSeedReps, 1);
-    evaluateTime(evaluationTimeLimitAnalysis);
+    setupEvaluation(&analysisPos, &bestWeights, 1);
+
+    unsigned long long start = getTime();
+
+    waitEvaluation(evaluationTimeLimitAnalysis, INT_MAX, INT_MAX);
+
+    unsigned long long end = getTime();
 
     // Print the choices and their evals.
     int numChoices = nodes->numChildren;
-    printf("Analyzed for max %f seconds and found %i moves for ", evaluationTimeLimitAnalysis, numChoices);
+    double ms = (double)(end - start) / 1000000.0;
+    printf("Analyzed for max %i ms (actual %i ms) and found %i moves for ", evaluationTimeLimitAnalysis, (int)ms, numChoices);
     playerTurn ? printf("Black") : printf("White");
 
-    printf(" with %i nodes (%i moves).\n", numNodes.load(), globalMoveLength.load());
+    printf(" with %i nodes.\n", numNodes.load());
 
-    printf("# nodes added / moves added / nodes examined: %i/%i/%i\n", calcNumNodesAdded.load(), calcNumMovesAdded.load(), calcNumNodesExamined.load());
+    int nodesAdded = calcNumNodesAdded.load();
+    int nodesExamined = calcNumNodesExamined.load();
+    printf("%i nodes added (%f per ms)\n", nodesAdded, (double)nodesAdded / ms);
+    printf("%i nodes examined (%f per ms)\n", nodesExamined, (double)nodesExamined / ms);
 
     printf("# stalemates / white wins / black wins / normals found: %i/%i/%i/%i\n", calcNumStalematesFound.load(), calcNumWhiteWinsFound.load(), calcNumBlackWinsFound.load(), calcNumNormalsFound.load());
 
     for (int i = 0; i < numChoices; i++) {
         printf("----------");
-        printf(moveToString(i));
+        printf(moveToString(i, &analysisPos));
         printf(": ");
-        eval e = sortedMoves[i]->e.load();
+        eval e = sortedMoves[i]->e;
         printEval(e);
         printf("----------\n");
 
-        int nc = sortedMoves[i]->numChildren;
-        for (int j = 0; j < nc; j++) {
-            N* child = nodes + sortedMoves[i]->childStartIndex + j;
-            printf("%s%s: ", getSquareHuman(child->SQUARE_FROM), getSquareHuman(child->SQUARE_TO));
-            printEval(child->e.load());
-            printf("   ");
+        if (printAnalysisResponses) {
+            int nc = sortedMoves[i]->numChildren;
+            for (int j = 0; j < nc; j++) {
+                node* child = nodes + sortedMoves[i]->childStartIndex + j;
+                printf("%s%s: ", squareToString(child->moveFrom), squareToString(child->moveTo));
+                printEval(child->e);
+                printf("   ");
+            }
+            printf("\n");
         }
-        printf("\n");
     }
     printf("\n");
-
 }
 
 // Set a bool setting based on the user typing y/n.
@@ -4920,9 +4375,10 @@ void printSettings() {
     printf("Use capital letters for board coordinates: %s\n", useCapitalCoordinates ? "YES" : "NO");
     printf("Print the move choices after evaluating in a 1-player game: %s\n", evaluationPrintChoices ? "YES" : "NO");
     printf("Use pluses on eval numbers: %s\n", usePlusesOnEvalNumbers ? "YES" : "NO");
-    printf("Minimum time limit for game evaluation: %f seconds\n", evaluationTimeLimitMin);
-    printf("Maximum time limit for game evaluation: %f seconds\n", evaluationTimeLimitMax);
-    printf("Time limit for analysis evaluation: %f seconds\n", evaluationTimeLimitAnalysis);
+    printf("Print responses to moves in analysis: %s\n", printAnalysisResponses ? "YES" : "NO");
+    printf("Minimum time limit for game evaluation: %i ms\n", evaluationTimeLimitMin);
+    printf("Maximum time limit for game evaluation: %i ms\n", evaluationTimeLimitMax);
+    printf("Time limit for analysis evaluation: %i ms\n", evaluationTimeLimitAnalysis);
     printf("Evaluation depth limit: %i\n", evaluationDepthLimit);
     
     printf("Draw offering: ");
@@ -4941,20 +4397,6 @@ void printSettings() {
 
 // Settings menu.
 void settings() {
-    /*  Settings guide:
-    bool unicodeEnabled = 0;
-    bool reverseWhiteBlackLetters = 0;
-    bool useAsterisk = 0;
-    bool showBoardCoordinates = 1;
-    bool useCapitalCoordinates = 1;
-    bool evaluationPrintChoices = 1;
-    bool usePlusesOnEvalNumbers = 1;
-    // Settings that affect the actual evaluation algorithm.
-    double evaluationTimeLimitMin = 1.0; // seconds
-    double evaluationTimeLimitMax = 1.0; // seconds
-    double evaluationTimeLimitAnalysis = 1.0; // seconds
-    int evaluationDepthLimit = 30; // 0 means do not add root's children to queue, etc.
-    */
 
     printf("Current settings:\n");
     printSettings();
@@ -4980,17 +4422,20 @@ void settings() {
     printf("Use pluses on eval numbers (y/n): ");
     setBoolSetting(&usePlusesOnEvalNumbers);
 
-    printf("Minimum time limit for game evaluation [0.001, 100.0]: ");
-    evaluationTimeLimitMin = getNumber(0.001, 100.0, 1);
+    printf("Print responses to moves in analysis (y/n): ");
+    setBoolSetting(&printAnalysisResponses);
 
-    printf("Maximum time limit for game evaluation [%f, 100.0]: ", evaluationTimeLimitMin);
-    evaluationTimeLimitMax = getNumber(evaluationTimeLimitMin, 100.0, 1);
+    printf("Minimum time limit for game evaluation [1, 100000]: ");
+    evaluationTimeLimitMin = getNumber(1, 100000, 0);
 
-    printf("Time limit for analysis evaluation [0.001, 100.0]: ");
-    evaluationTimeLimitAnalysis = getNumber(0.001, 100.0, 1);
+    printf("Maximum time limit for game evaluation [%i, 100000]: ", evaluationTimeLimitMin);
+    evaluationTimeLimitMax = getNumber(evaluationTimeLimitMin, 100000, 0);
 
-    printf("Evaluation depth limit [0, 100]: ");
-    evaluationDepthLimit = getNumber(0, 100, 0);
+    printf("Time limit for analysis evaluation [1, 100000]: ");
+    evaluationTimeLimitAnalysis = getNumber(1, 100000, 1);
+
+    printf("Evaluation depth limit [1, 100]: ");
+    evaluationDepthLimit = getNumber(1, 100, 0);
 
     printf("Draw offering (n for no draws, a to ask for a draw, f to force a draw: ");
     switch (getChar()) {
@@ -5027,7 +4472,7 @@ void printSelfWeights(W* w, char piece) {
 
 // Perform one step of the evaluation training process.
 // adjustmentFactor is between 0 and 1 and is how much of a piece's point value its self-weight can change by per step.
-void trainStep(double spm, int numSeedReps, double adjustmentFactor) {
+void trainStep(double spm, double adjustmentFactor) {
     int numModels = 2;
 
     // Allocate trainingWeights if unallocated.
@@ -5070,29 +4515,30 @@ void trainStep(double spm, int numSeedReps, double adjustmentFactor) {
 
     // Have the models play a game against each other.
     while (1) {
+        position* pos = history + gameLength - 1;
+        char* b = pos->board;
         clearConsole();
-        drawBoard(history[gameLength - 1], WHITE);
-        printSelfWeights(trainingWeights, 2);
-
+        drawBoard(b, WHITE);
         copyGamePosition();
 
-        D* ld = historyD + gameLength - 1;
+        printSelfWeights(trainingWeights, 2);
 
         // Either model chooses a move.
-        setupEvaluation(history[gameLength - 1], ld, trainingWeights + (gameLength % 2), numSeedReps, 1);
-        evaluateTime(spm);
+        setupEvaluation(pos, trainingWeights + (gameLength % 2), 1);
+        waitEvaluation(spm, INT_MAX, INT_MAX);
 
         if (nodes->numChildren == 0) break;
 
-        ld->SQUARE_FROM = sortedMoves[0]->SQUARE_FROM;
-        ld->SQUARE_TO = sortedMoves[0]->SQUARE_TO;
-        ld->PLAYER_TURN = 1 - (historyD + gameLength - 2)->PLAYER_TURN;
+        pos->SQUARE_FROM = sortedMoves[0]->moveFrom;
+        pos->SQUARE_TO = sortedMoves[0]->moveTo;
+        pos->PLAYER_TURN = 1 - (history + gameLength - 2)->PLAYER_TURN;
 
         if (playAndCheckEndOfGame(1)) break;
     }
 
     // If the game ended in a checkmate, copy the trainingWeights of the winner to bestWeights.
-    int result = (historyD + gameLength - 1)->GAME_STATE;
+    position* pos = history + gameLength - 1;
+    int result = pos->GAME_STATE;
     int winner = -1;
     if (result == 1) {
         winner = 0;
@@ -5112,7 +4558,7 @@ void trainStep(double spm, int numSeedReps, double adjustmentFactor) {
     }
 
     clearConsole();
-    drawBoard(history[gameLength - 1], WHITE);
+    drawBoard(pos->board, WHITE);
     printf("Finished a training game. Winner was %i.\n", winner);
 }
 
@@ -5123,8 +4569,6 @@ void train() {
     double time = getNumber(0.001, 100000.0, 1);
     printf("Seconds per move [0.00001, 100.0]: ");
     double spm = getNumber(0.00001, 100.0, 1);
-    printf("Seed reps [0, 10000]: ");
-    double numSeedReps = getNumber(0, 10000, 0);
     printf("Weight adjustment factor [0.0, 1.0]: ");
     double adjustmentFactor = getNumber(0.0, 1.0, 1);
 
@@ -5144,7 +4588,7 @@ void train() {
         }
 
         // Perform one step of the training.
-        trainStep(spm, numSeedReps, adjustmentFactor);
+        trainStep(spm, adjustmentFactor);
     }
 }
 
@@ -5238,26 +4682,24 @@ int readInt() {
 }
 
 // Read a position code and allocate and set the analysisBoard to the position.
-void readPosition(char* p, char* b, D* d) {
-
-    setupAnalysisBoard();
+void readPosition(char* text, position* pos) {
 
     // Fill the analysisBoard with chars from input.
     for (int i = 0; i < 64; i++) {
-        b[i] = readInt();
+        pos->board[i] = readInt();
     }
-    d->wKINGSIDE_CASTLE = readInt();
-    d->wQUEENSIDE_CASTLE = readInt();
-    d->bKINGSIDE_CASTLE = readInt();
-    d->bQUEENSIDE_CASTLE = readInt();
-    d->EN_PASSANT_FILE = readInt();
-    d->FIFTY_MOVE_COUNTER = readInt();
-    d->wKING_SQUARE = readInt();
-    d->bKING_SQUARE = readInt();
-    d->SQUARE_FROM = readInt();
-    d->SQUARE_TO = readInt();
-    d->PLAYER_TURN = readInt();
-    d->GAME_STATE = readInt();
+    pos->wKINGSIDE_CASTLE = readInt();
+    pos->wQUEENSIDE_CASTLE = readInt();
+    pos->bKINGSIDE_CASTLE = readInt();
+    pos->bQUEENSIDE_CASTLE = readInt();
+    pos->EN_PASSANT_FILE = readInt();
+    pos->FIFTY_MOVE_COUNTER = readInt();
+    pos->wKING_SQUARE = readInt();
+    pos->bKING_SQUARE = readInt();
+    pos->SQUARE_FROM = readInt();
+    pos->SQUARE_TO = readInt();
+    pos->PLAYER_TURN = readInt();
+    pos->GAME_STATE = readInt();
 }
 
 void writeBool(bool x) {
@@ -5308,78 +4750,74 @@ void writeString(char* x) {
     outLinePos++;
 }
 
-void _init(int totalNumNodesAllowed, int totalNumMovesAllowed, int threadCount) {
-    writeBool(init(totalNumNodesAllowed, totalNumMovesAllowed, threadCount));
+void _init(int totalNumNodesAllowed, int threadCount) {
+    writeBool(init(totalNumNodesAllowed, threadCount));
 }
 
 // Run the setup for analysis operation after init has been called.
-void _setupEvaluation(int depthLimit, int numSeedReps, char* position) {
+void _setupEvaluation(int depthLimit, char* text) {
 
     // Set settings based on the details.
     evaluationDepthLimit = depthLimit;
 
-    readPosition(position, analysisBoard, &analysisD);
-    writeBool(setupEvaluation(analysisBoard, &analysisD, &bestWeights, numSeedReps, 1));
-}
-
-// Run the analyze operation after runSetupAnalysis has been called.
-void _evaluateTime(int timeLimitMS) {
-    writeBool(evaluateTime((double)timeLimitMS / 1000.0));
-}
-
-// Run the analyze operation after runSetupAnalysis has been called.
-void _evaluateStart() {
-    writeBool(evaluateStart());
-}
-
-// Run the analyze operation after runSetupAnalysis has been called.
-void _evaluateStop() {
-    writeBool(evaluateStop());
+    readPosition(text, &analysisPos);
+    writeBool(setupEvaluation(&analysisPos, &bestWeights, 1));
 }
 
 // Test a position for legality.
 // Print a 1 or 0 depending on whether the given move is legal on the given position.
-void _testLegality(char f, char t, char* position) {
-
-    char testBoard[64] = { 0 };
-    D testD;
-    readPosition(position, testBoard, &testD);
+void _testLegality(char f, char t, char* text) {
+    position testPos;
+    readPosition(text, &testPos);
 
     // Return if the move is legal.
-    writeBool(isLegalMove(testBoard, &testD, f, t));
+    writeBool(isLegalMove(&testPos, f, t));
 }
 
 // Test a position for check.
 // Print a 1 or 0 depending on whether the given king is in check on the given position.
-void _testCheck(bool isBlack, char* position) {
-
-    char testBoard[64] = { 0 };
-    D testD;
-    readPosition(position, testBoard, &testD);
+void _testCheck(bool isBlack, char* text) {
+    position testPos;
+    readPosition(text, &testPos);
 
     // Return if the king is in check.
-    char kingSquare = isBlack ? analysisD.bKING_SQUARE : analysisD.wKING_SQUARE;
-    writeBool(!kingNotInCheck(testBoard, kingSquare));
+    char kingSquare = isBlack ? analysisPos.bKING_SQUARE : analysisPos.wKING_SQUARE;
+    writeBool(!kingNotInCheck(testPos.board, kingSquare));
 }
 
 void _getOutputData() {
+    getSortedChoices();
+
     if (nodes == 0) {
         writeInt(0);
     }
     else {
         writeInt(nodes->numChildren);
-        getSortedChoices();
         int numChoices = nodes->numChildren;
         for (int i = 0; i < numChoices; i++) {
-            writeInt(sortedMoves[i]->SQUARE_FROM);
-            writeInt(sortedMoves[i]->SQUARE_TO);
-            writeInt(sortedMoves[i]->e.load());
-            writeString(moveToString(i));
+            writeInt(sortedMoves[i]->moveFrom);
+            writeInt(sortedMoves[i]->moveTo);
+            writeInt(sortedMoves[i]->e);
+            writeString(moveToString(i, &analysisPos));
         }
     }
     writeInt(calcNumNodesAdded.load());
-    writeInt(calcNumMovesAdded.load());
     writeInt(calcNumNodesExamined.load());
+}
+
+void _startEvaluation(int timeLimitMS, int addLimit, int examineLimit) {
+    if (!setupComplete) {
+        writeBool(0);
+        return;
+    }
+    startEvaluation(timeLimitMS, addLimit, examineLimit);
+    writeBool(1);
+}
+
+void _stopEvaluation() {
+    stopEvaluation();
+    getSortedChoices();
+    writeBool(1);
 }
 
 inline bool firstTwo(char a, char b) {
@@ -5388,17 +4826,16 @@ inline bool firstTwo(char a, char b) {
 
 int main(int argc, char* argv[]) {
     resetBuffers();
-    setupAnalysisBoard();
     setupWeights(0);
-
+    
     if (argc == 1) {
         // Run the input checker.
         while (1) {
             getLine();
             inLinePos = 3;
             outLinePos = 0;
-            // se 30 -1 -1 -1 -1 -1 -1 8 -1 -1 -1 5 2 -1 -1 -1 9 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 0 -1 -1 6 -1 -1 0 -1 6 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 6 11 -1 6 -1 6 -1 -1 -1 -1 -1 -1 -1 -1 0 0 0 0 0 0 10 51 48 32 0 0
-            if (inLine[0] == '\n' || firstTwo('g', 'o')) {
+            
+            if (inLine[0] == '\n') {
                 break; // Escape the input checker.
             } else if (firstTwo('e', 'x')) {
                 return 0;
@@ -5411,26 +4848,21 @@ int main(int argc, char* argv[]) {
                 _testCheck(isBlack, inLine + inLinePos);
             } else if (firstTwo('i', 'n')) {
                 int totalNumNodesAllowed = readInt();
-                int totalNumMovesAllowed = readInt();
                 int threadCount = readInt();
-                _init(totalNumNodesAllowed, totalNumMovesAllowed, threadCount);
+                _init(totalNumNodesAllowed, threadCount);
             } else if (firstTwo('s', 'e')) {
                 int depthLimit = readInt();
-                int numSeedReps = readInt();
-                _setupEvaluation(depthLimit, numSeedReps, inLine + inLinePos);
-            } else if (firstTwo('e', '0')) {
-                _evaluateStart();
-            } else if (firstTwo('e', '1')) {
-                _evaluateStop();
-            } else if (firstTwo('e', 't')) {
-                int timeLimitMS = readInt();
-                _evaluateTime(timeLimitMS);
+                _setupEvaluation(depthLimit, inLine + inLinePos);
+            } else if (firstTwo('g', 'o')) {
+                // Start the evaluation. This thread will keep checking input for whether to stop while other threads evaluate.
+                _startEvaluation(INT_MAX, INT_MAX, INT_MAX);
+            } else if (firstTwo('s', 't')) {
+                // Stop the evaluation.
+                _stopEvaluation();
             } else if (firstTwo('g', 'd')) {
                 _getOutputData();
             }
-            // in 100000 1000000 10
-            // se 40 50 -1 -1 -1 -1 5 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 11 -1 -1 -1 -1 0 0 0 0 -1 0 4 60 -1 -1 0 0 
-            
+
             // Finish and print the outLine.
             outLine[outLinePos] = '\n';
             outLinePos++;
@@ -5441,9 +4873,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    SetConsoleOutputCP(CP_UTF8); // unicode display
+    SetConsoleOutputCP(CP_UTF8);
 
-    init(5000000, 100000000, 10);
+    init(20000000, 2);
 
     runUI();
     
